@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var windowController: MainWindowController!
     private var hotKey: HotKey?
     private var settingsWindow: NSWindow?
+    private lazy var tuck = TuckAway { [weak self] in self?.showPad(nil) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if ProcessInfo.processInfo.environment["JOT_SELFTEST"] != nil { SelfTest.run() }
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         NSApp.mainMenu = buildMainMenu()
         windowController = MainWindowController()
+        windowController.onTopStripDoubleClick = { [weak self] in self?.tuckIntoMenuBar(nil) }
         windowController.showWindow(nil)
         NSApp.activate()
 
@@ -62,9 +64,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc func showPad(_ sender: Any?) {
         guard let windowController else { return }
+        tuck.untuck()
+        if NSApp.isHidden { NSApp.unhide(nil) }
         if windowController.window?.isMiniaturized == true { windowController.window?.deminiaturize(nil) }
         windowController.showWindow(nil)
         NSApp.activate()
+    }
+
+    /// Tucks the pad into the menu bar until you click the icon (or come back
+    /// any other way). The icon is only there while it's tucked.
+    @objc func tuckIntoMenuBar(_ sender: Any?) {
+        guard let window = windowController?.window, window.isVisible else { return }
+        windowController.flush()
+        tuck.tuck(window)
     }
 
     func applicationWillResignActive(_ notification: Notification) { windowController.flush() }
@@ -77,8 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if NSApp.isActive, windowController.window?.isKeyWindow == true {
             NSApp.hide(nil)
         } else {
-            windowController.showWindow(nil)
-            NSApp.activate()
+            showPad(nil)
         }
     }
 
@@ -101,6 +112,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(toggleFloatOnTop(_:)) { item.state = Preferences.floatOnTop ? .on : .off }
+        if item.action == #selector(tuckIntoMenuBar(_:)) {
+            return windowController?.window?.isVisible == true && windowController?.window?.styleMask.contains(.fullScreen) == false
+        }
         return true
     }
 
@@ -185,6 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         window.addItem(.separator())
         window.addItem(withTitle: "Show Jot", action: #selector(showPad(_:)), keyEquivalent: "1")
+        window.addItem(withTitle: "Tuck into Menu Bar", action: #selector(tuckIntoMenuBar(_:)), keyEquivalent: "M")
         window.addItem(.separator())
         main.addSubmenu(window, title: "Window")
         NSApp.windowsMenu = window

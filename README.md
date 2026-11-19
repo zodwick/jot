@@ -24,6 +24,7 @@ You only need the Xcode Command Line Tools (Swift 6.2+). The app targets macOS 2
 | Tab / ⇧Tab | Nest / un-nest list items (or ⌘] / ⌘[) |
 | ⌘F | Find |
 | ⌘1 | Show the pad again (so does ⌘Tab back to Jot or clicking its Dock icon) |
+| Double-click the top of the pad, or ⇧⌘M | Tuck it into the menu bar. A small icon appears there only while it's tucked; click it (or ⌘Tab / Dock / ⌘1) to bring the pad back |
 
 Type Markdown and the markers disappear as you go:
 

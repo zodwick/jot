@@ -33,7 +33,7 @@ private final class SettingsViewController: NSViewController {
         hotKeyBox.action = #selector(hotKeyChanged)
         hotKeyNote.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         hotKeyNote.textColor = .systemOrange
-        let floatNote = small("The glass gets a little clearer while floating.")
+        let floatNote = small("The glass gets a little clearer while floating.\nDouble-click the top of the pad to tuck it into the menu bar (⇧⌘M).")
 
         sizeStepper.minValue = 10
         sizeStepper.maxValue = 32

@@ -9,7 +9,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTextVi
     private var editor: MarkdownEditorStack!
 
     init() {
-        let window = NSWindow(
+        let window = JotWindow(
             contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -117,6 +117,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTextVi
         flush()
         sender.orderOut(nil)
         return false
+    }
+
+    /// Double-click on the top strip (beside the traffic lights).
+    var onTopStripDoubleClick: (() -> Void)? {
+        get { (window as? JotWindow)?.onTopStripDoubleClick }
+        set { (window as? JotWindow)?.onTopStripDoubleClick = newValue }
     }
 
     override func showWindow(_ sender: Any?) {
