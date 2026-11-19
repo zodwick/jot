@@ -33,10 +33,65 @@ final class EditorTextView: NSTextView {
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         var ranges = ranges
         if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
-            let s = snapped(r.location)
+            var s = snapped(r.location)
+            s = offImageLine(s, movingBack: s < selectedRange().location)
             if s != r.location { ranges = [NSValue(range: NSRange(location: s, length: 0))] }
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+    }
+
+    // MARK: Images are blocks
+
+    /// The line holding an inline image, if `loc` is on one. Images always sit
+    /// on their own line, and the caret never rests there: a caret beside an
+    /// image would be as tall as the image (macOS sizes it to the line).
+    private func imageLine(at loc: Int) -> NSRange? {
+        guard let s = textStorage, s.length > 0 else { return nil }
+        let line = ns.lineRange(for: NSRange(location: min(loc, s.length), length: 0))
+        guard line.length > 0 else { return nil }
+        var found = false
+        s.enumerateAttribute(.attachment, in: line) { value, _, stop in
+            if (value as? NSTextAttachment)?.attachmentCell is ImageAttachmentCell { found = true; stop.pointee = true }
+        }
+        return found ? line : nil
+    }
+
+    /// Moves a caret that landed on an image line to the nearest text line in
+    /// the direction it was travelling (walking past stacked images), falling
+    /// back to the other direction at the start/end of the page.
+    private func offImageLine(_ loc: Int, movingBack: Bool) -> Int {
+        var back = movingBack
+        var pos = loc
+        for _ in 0..<64 {
+            guard let line = imageLine(at: pos) else { return pos }
+            let endsWithNewline = ns.character(at: NSMaxRange(line) - 1) == 10
+            if back, line.location > 0 {
+                pos = line.location - 1            // end of the line above
+            } else if endsWithNewline {
+                pos = NSMaxRange(line)             // start of the line below
+                back = false
+            } else if line.location > 0 {
+                pos = line.location - 1
+                back = true
+            } else {
+                return loc                         // the page is just an image
+            }
+        }
+        return loc
+    }
+
+    /// The image attachment character on the line ending just before `loc`.
+    private func imageEnding(before loc: Int) -> NSRange? {
+        guard loc > 0, ns.character(at: loc - 1) == 10, let line = imageLine(at: loc - 1) else { return nil }
+        return imageCharacter(in: line)
+    }
+
+    private func imageCharacter(in line: NSRange) -> NSRange? {
+        var hit: NSRange?
+        textStorage?.enumerateAttribute(.attachment, in: line) { value, r, stop in
+            if (value as? NSTextAttachment)?.attachmentCell is ImageAttachmentCell { hit = NSRange(location: r.location, length: 1); stop.pointee = true }
+        }
+        return hit
     }
 
     // MARK: Arrow keys skip invisible characters
@@ -78,6 +133,12 @@ final class EditorTextView: NSTextView {
         guard sel.length == 0, sel.location > 0 else { return super.deleteBackward(sender) }
         let p = sel.location
 
+        // Right below an image: select it first; a second Backspace deletes it.
+        if let image = imageEnding(before: p) {
+            setSelectedRange(image)
+            return
+        }
+
         // At the start of a list item / heading / quote: drop (or outdent) the prefix.
         if let pre = prefixRange(at: p - 1), NSMaxRange(pre) == p {
             removePrefix(pre)
@@ -99,6 +160,12 @@ final class EditorTextView: NSTextView {
     override func deleteForward(_ sender: Any?) {
         let sel = selectedRange()
         guard sel.length == 0, sel.location < length else { return super.deleteForward(sender) }
+        // Right above an image: select it first; a second Delete removes it.
+        if ns.character(at: sel.location) == 10, let line = imageLine(at: sel.location + 1),
+           line.location == sel.location + 1, let image = imageCharacter(in: line) {
+            setSelectedRange(image)
+            return
+        }
         var c = sel.location
         while c < length, isHidden(c) { c += 1 }
         guard c < length else { return }
@@ -373,7 +440,7 @@ final class EditorTextView: NSTextView {
         var text = markdown.joined(separator: anyImage ? "\n" : " ")
         if anyImage {
             if sel.location > line.location { text = "\n" + text }
-            if NSMaxRange(sel) < length, ns.character(at: NSMaxRange(sel)) != 10 { text += "\n" }
+            if NSMaxRange(sel) == length || ns.character(at: NSMaxRange(sel)) != 10 { text += "\n" }
         }
         replace(sel, with: Atoms.decode(text, styler: styler))
     }

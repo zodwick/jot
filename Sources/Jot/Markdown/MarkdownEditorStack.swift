@@ -63,7 +63,9 @@ final class MarkdownEditorStack {
         storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: "")
         storage.endEditing()
         storage.beginEditing()
-        storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: Atoms.decode(markdown, styler: styler))
+        let decoded = NSMutableAttributedString(attributedString: Atoms.decode(markdown, styler: styler))
+        Atoms.isolateImages(decoded, styler: styler)
+        storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: decoded)
         storage.endEditing()   // the styling delegate styles the whole page here
         textView.undoManager?.removeAllActions()
     }

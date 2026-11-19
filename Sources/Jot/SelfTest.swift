@@ -64,7 +64,7 @@ enum SelfTest {
         // Atoms round-trip through load → save and copy.
         do {
             let stack = MarkdownEditorStack()
-            let md = "before ![](attachments/a.png) mid [r.pdf](attachments/r.pdf) after\n"
+            let md = "before\n![](attachments/a.png)\nmid [r.pdf](attachments/r.pdf) after\n"
             stack.load(markdown: md)
             let len = stack.storage.length
             if stack.markdown() == md, len < (md as NSString).length { passed += 1 }
@@ -103,9 +103,35 @@ enum SelfTest {
             stack.textView.setSelectedRange(NSRange(location: stack.storage.length, length: 0))
             _ = stack.textView.readSelection(from: pb, type: .tiff)
             let md2 = stack.markdown()
-            if md2.contains("\n![](attachments/image-"), md2.hasSuffix(".png)") { passed += 1 }
+            if md2.contains("\n![](attachments/image-"), md2.hasSuffix(".png)\n") { passed += 1 }
             else { failures += 1; print("FAIL paste image: \(md2.debugDescription)") }
             pb.releaseGlobally()
+        }
+
+        // Images are blocks: own line on load, caret never rests beside one,
+        // Backspace below selects it first, then deletes it.
+        do {
+            let stack = MarkdownEditorStack()
+            stack.load(markdown: "a\n![](attachments/x.png)b")
+            let tv = stack.textView
+            var ok = stack.markdown() == "a\n![](attachments/x.png)\nb"   // split onto its own line
+            // storage: "a"0 "\n"1 IMG2 "\n"3 "b"4
+            tv.setSelectedRange(NSRange(location: 1, length: 0))
+            tv.moveRight(nil)
+            ok = ok && tv.selectedRange().location == 4                    // skips the image line
+            tv.moveLeft(nil)
+            ok = ok && tv.selectedRange().location == 1                    // and back over it
+            tv.setSelectedRange(NSRange(location: 4, length: 0))
+            tv.deleteBackward(nil)
+            ok = ok && tv.selectedRange() == NSRange(location: 2, length: 1) // first: selects the image
+            tv.deleteBackward(nil)
+            ok = ok && stack.markdown() == "a\n\nb"                         // second: deletes it
+            if ok { passed += 1 } else { failures += 1; print("FAIL image block: \(stack.markdown().debugDescription) sel=\(tv.selectedRange())") }
+
+            let end = MarkdownEditorStack()
+            end.load(markdown: "x![](attachments/x.png)")
+            if end.markdown() == "x\n![](attachments/x.png)\n" { passed += 1 }
+            else { failures += 1; print("FAIL image at end: \(end.markdown().debugDescription)") }
         }
 
         // Floating makes the glass clearer: fixed points, bounds, and no jumps.

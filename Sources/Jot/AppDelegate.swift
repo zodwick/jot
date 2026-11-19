@@ -48,8 +48,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        windowController.showWindow(nil)
+        showPad(nil)
         return true
+    }
+
+    /// ⌘Tab / the app switcher only activate an app; they don't send "reopen".
+    /// Jot is a one-window app, so coming back to it should bring the pad back
+    /// if it was closed (a window you minimized stays in the Dock as usual).
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard let window = windowController?.window else { return }   // nil while launching
+        if !window.isVisible, !window.isMiniaturized { showPad(nil) }
+    }
+
+    @objc func showPad(_ sender: Any?) {
+        guard let windowController else { return }
+        if windowController.window?.isMiniaturized == true { windowController.window?.deminiaturize(nil) }
+        windowController.showWindow(nil)
+        NSApp.activate()
     }
 
     func applicationWillResignActive(_ notification: Notification) { windowController.flush() }
@@ -168,6 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let window = NSMenu(title: "Window")
         window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        window.addItem(.separator())
+        window.addItem(withTitle: "Show Jot", action: #selector(showPad(_:)), keyEquivalent: "1")
+        window.addItem(.separator())
         main.addSubmenu(window, title: "Window")
         NSApp.windowsMenu = window
 

@@ -23,6 +23,7 @@ You only need the Xcode Command Line Tools (Swift 6.2+). The app targets macOS 2
 | ⌘8 / ⌘7 / ⌘⇧L | Bulleted / numbered / checklist |
 | Tab / ⇧Tab | Nest / un-nest list items (or ⌘] / ⌘[) |
 | ⌘F | Find |
+| ⌘1 | Show the pad again (so does ⌘Tab back to Jot or clicking its Dock icon) |
 
 Type Markdown and the markers disappear as you go:
 
@@ -34,7 +35,7 @@ Type Markdown and the markers disappear as you go:
 
 On a list item, Return continues the list. Return on an empty item ends it, and Backspace at the start of an item removes its bullet.
 
-Paste or drop a file to add it. Images appear inline. Other files show as a chip that you double-click to open.
+Paste or drop a file to add it. Images sit on their own line: the cursor skips past them, and Backspace just below an image selects it first, then deletes it. Other files show as a chip that you double-click to open.
 
 ## Where things live
 
