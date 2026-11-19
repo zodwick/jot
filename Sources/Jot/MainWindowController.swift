@@ -90,13 +90,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSTextVi
 
     // MARK: Preferences
 
+    private var wasFloating: Bool?
+
     @objc private func applyPreferences() {
         guard let window else { return }
-        window.level = Preferences.floatOnTop ? .floating : .normal
-        window.collectionBehavior = Preferences.floatOnTop
+        let floating = Preferences.floatOnTop
+        window.level = floating ? .floating : .normal
+        window.collectionBehavior = floating
             ? [.fullScreenAuxiliary, .canJoinAllSpaces]
             : [.fullScreenAuxiliary, .moveToActiveSpace]
-        GlassAppearance.apply(glass: glass, scrim: scrim, density: Preferences.glassDensity)
+        // Fade only when floating is switched; slider drags and launch apply instantly.
+        let floatingChanged = wasFloating != nil && wasFloating != floating
+        wasFloating = floating
+        GlassAppearance.apply(glass: glass, scrim: scrim, density: Preferences.glassDensity,
+                              floating: floating, animated: floatingChanged)
         editor.setBaseFontSize(Preferences.fontSize)
     }
 

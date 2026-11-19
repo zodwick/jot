@@ -8,13 +8,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if ProcessInfo.processInfo.environment["JOT_SELFTEST"] != nil { SelfTest.run() }
+
+        // Another Jot already has this page open (e.g. a second copy of the app):
+        // bring that one forward instead of opening the same file twice.
+        guard Store.shared.acquireLock() else {
+            let me = NSRunningApplication.current
+            NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.jot.app")
+                .first { $0 != me }?
+                .activate()
+            exit(0)
+        }
+
         NSApp.mainMenu = buildMainMenu()
         windowController = MainWindowController()
         windowController.showWindow(nil)
         NSApp.activate()
 
-        // ⌥Space toggles Jot from anywhere.
+        updateHotKey()
+        NotificationCenter.default.addObserver(self, selector: #selector(updateHotKey),
+                                               name: .jotPreferencesChanged, object: nil)
+    }
+
+    /// Registers or releases the optional ⌥Space hotkey to match Preferences.
+    @objc private func updateHotKey() {
+        let wanted = Preferences.globalHotKey
+        guard wanted != (hotKey != nil) else { return }
+        guard wanted else {
+            hotKey = nil   // deinit unregisters it
+            return
+        }
         hotKey = HotKey(keyCode: kVK_Space, modifiers: optionKey) { [weak self] in self?.toggleFromHotKey() }
+        if hotKey == nil {
+            // Taken by another app (or the system): turn the setting back off and say why.
+            Preferences.hotKeyProblem = "⌥Space is already used by another app."
+            Preferences.globalHotKey = false
+        } else {
+            Preferences.hotKeyProblem = nil
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

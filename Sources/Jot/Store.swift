@@ -30,6 +30,26 @@ final class Store {
         }
     }
 
+    // MARK: Single writer
+
+    private var lockFD: Int32 = -1
+
+    /// Takes an exclusive lock on the data folder for this process's lifetime
+    /// (released automatically when it exits, even on a crash). Returns false if
+    /// another Jot already holds it: two copies editing one page.md would
+    /// overwrite each other's changes.
+    func acquireLock() -> Bool {
+        if lockFD >= 0 { return true }
+        let fd = open(directory.appendingPathComponent(".lock").path, O_CREAT | O_RDWR, 0o644)
+        guard fd >= 0 else { return true }   // can't lock (odd filesystem): don't block launching
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)
+            return false
+        }
+        lockFD = fd
+        return true
+    }
+
     // MARK: Page
 
     func load() -> String {

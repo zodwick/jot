@@ -108,6 +108,27 @@ enum SelfTest {
             pb.releaseGlobally()
         }
 
+        // Floating makes the glass clearer: fixed points, bounds, and no jumps.
+        do {
+            let e = { (d: Double) in GlassAppearance.effectiveDensity(d, floating: true) }
+            let close = { (a: Double, b: Double) in abs(a - b) < 1e-9 }
+            var ok = close(e(0), 0) && close(e(0.1), 0.05) && close(e(0.35), 0.23) && close(e(1), 0.88)
+            ok = ok && close(GlassAppearance.effectiveDensity(0.6, floating: false), 0.6)   // not floating: unchanged
+            ok = ok && close(e(-1), 0) && close(e(2), 0.88)                                // out-of-range input clamps
+            var previous = -1.0
+            for i in 0...1000 {                                                            // monotonic, always clearer,
+                let d = Double(i) / 1000                                                   // never more than halved
+                let v = e(d)
+                ok = ok && v >= previous - 1e-12 && v <= d && v >= d * 0.5 - 1e-12 && d - v <= GlassAppearance.floatingShift + 1e-12
+                previous = v
+            }
+            if ok { passed += 1 } else { failures += 1; print("FAIL floating density curve") }
+        }
+
+        // The global shortcut is opt-in.
+        if UserDefaults.standard.object(forKey: "globalHotKey") != nil || !Preferences.globalHotKey { passed += 1 }
+        else { failures += 1; print("FAIL hotkey should default to off") }
+
         // Big page: styling + incremental edit should stay fast.
         do {
             let line = "- item with **bold** and `code` and a [link](https://example.com)\n"
