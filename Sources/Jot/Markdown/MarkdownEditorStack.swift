@@ -24,6 +24,7 @@ final class MarkdownEditorStack {
         textView = EditorTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 500), textContainer: container)
         textView.styler = styler
         configure(textView)
+        styler.visibleRange = { [weak textView] in textView?.visibleCharacterRange() }
     }
 
     private func configure(_ tv: EditorTextView) {
@@ -68,6 +69,10 @@ final class MarkdownEditorStack {
         textView.undoManager?.removeAllActions()
     }
 
+    /// Finishes any styling deferred after a big change (tests use this to
+    /// compare against a fresh load).
+    func finishStyling() { styler.flushPending() }
+
     func markdown() -> String {
         Atoms.encode(storage, range: NSRange(location: 0, length: storage.length))
     }
@@ -75,7 +80,10 @@ final class MarkdownEditorStack {
     func setBaseFontSize(_ size: CGFloat) {
         guard size != styler.baseSize else { return }
         styler.baseSize = size
+        // What's on screen is restyled at once; the rest of a long page in chunks.
+        let visible = textView.visibleCharacterRange()
         storage.restyleAll(with: styler)
+        if let visible { styler.styleNow(visible, in: storage) }
         textView.typingAttributes = styler.typingAttributes
     }
 }

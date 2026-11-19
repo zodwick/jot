@@ -2,7 +2,8 @@ import AppKit
 
 /// Turns Markdown text into display attributes, one paragraph at a time.
 /// Only the edited paragraphs are restyled on each keystroke; code fences are
-/// tracked with a cheap whole-document scan so a new ``` restyles what follows.
+/// tracked with a cheap whole-document scan, and a new ``` restyles only the
+/// lines that move into or out of a code block (big changes partly deferred).
 final class MarkdownStyler {
     var baseSize: CGFloat = 15 { didSet { rebuild() } }
 
@@ -27,12 +28,42 @@ final class MarkdownStyler {
     /// ever see the edited paragraphs instead of a copy of the whole page.
     private var text = ""
     private var base = 0
-    private var fenceCount = 0
+
+    // MARK: Deferred styling
+    //
+    // Big changes (a fence opened near the top of a long page, a paste, load,
+    // a font change) restyle only what's around the edit right away. The rest
+    // is remembered in `pending` and styled in small chunks on the main queue,
+    // what's on screen first. Invariant: every character outside `pending` is
+    // styled exactly as a fresh load of the current text would style it.
+
+    /// Characters whose styling is out of date. Shifts with every edit.
+    private(set) var pending = IndexSet()
+    /// What the current deferred pass styled (to settle AppKit's font fixing after it).
+    private var styledSpan: NSRange?
+    /// False only while the text certainly has no attachment (U+FFFC) characters,
+    /// which spares restyling a search for them. Attachments only ever arrive in
+    /// inserted text, and every insertion passes through `restyle`.
+    private var mayHaveAttachments = false
+    private weak var target: NSMutableAttributedString?
+    private var pumpScheduled = false
+    /// The editor's on-screen character range (nil when not in a scroll view).
+    var visibleRange: (() -> NSRange?)?
+    /// Up to this many characters are restyled synchronously; beyond that only
+    /// `syncWindow` characters around the edit are, and the rest is deferred.
+    static var syncLimit = 12_000
+    static var syncWindow = 3_000
+    /// Main-thread time one deferred chunk may take.
+    static var chunkBudget: TimeInterval = 0.004
 
     init() { rebuild() }
 
     var typingAttributes: [NSAttributedString.Key: Any] {
         [.font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: baseParagraph]
+    }
+
+    private var codeAttributes: [NSAttributedString.Key: Any] {
+        [.font: monoFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: codeParagraph]
     }
 
     private func rebuild() {
@@ -61,12 +92,15 @@ final class MarkdownStyler {
 
         paragraphCache = [:]
         widthCache = [:]
+        traitCache = [:]
     }
 
     // MARK: Entry points (called from the text storage delegate)
 
-    /// Restyles whatever an edit could have affected. Returns the restyled range.
-    func restyle(_ s: NSMutableAttributedString, edited: NSRange, delta: Int) -> NSRange {
+    /// Restyles whatever an edit could have affected: the edited paragraphs, and
+    /// any paragraph whose code-block membership the edit changed.
+    func restyle(_ s: NSMutableAttributedString, edited: NSRange, delta: Int) {
+        target = s
         let ns = s.mutableString
         var range = ns.paragraphRange(for: edited)
         // An edit ending in a newline (Return mid-line, a pasted line) made a new
@@ -74,69 +108,298 @@ final class MarkdownStyler {
         if NSMaxRange(edited) == NSMaxRange(range), NSMaxRange(range) < ns.length {
             range = NSUnionRange(range, ns.paragraphRange(for: NSRange(location: NSMaxRange(range), length: 0)))
         }
+        let edit = Edit(start: range.location, oldEnd: NSMaxRange(range) - delta, newEnd: NSMaxRange(range))
+        if !mayHaveAttachments, ns.range(of: "\u{FFFC}", options: .literal, range: range).location != NSNotFound {
+            mayHaveAttachments = true
+        }
+
+        // Stale text moves with the edit; the edited paragraphs are restyled below.
+        func shifted(_ set: IndexSet) -> IndexSet {
+            var set = set
+            if edit.oldEnd > edit.start { set.remove(integersIn: edit.start..<edit.oldEnd) }
+            if delta != 0 { set.shift(startingAt: edit.oldEnd, by: delta) }
+            set.remove(integersIn: ns.length..<max(ns.length, (set.last ?? 0) + 1))
+            return set
+        }
+        let stale = shifted(pending)
 
         // Fences only need a full rescan when the edited lines had or have one;
         // otherwise the known fence lines just shift by the edit's length.
-        let oldStart = range.location, oldEnd = NSMaxRange(range) - delta
-        let touchedOld = fenceLines.contains { $0.location <= oldEnd && NSMaxRange($0) > oldStart }
+        let touchedOld = fenceLines.contains { $0.location <= edit.oldEnd && NSMaxRange($0) > edit.start }
         let hasNew = ns.range(of: "```", options: .literal, range: range).location != NSNotFound
-        let shifted = fenceLines.map { $0.location >= oldEnd ? NSRange(location: $0.location + delta, length: $0.length) : $0 }
-        let rescanned = touchedOld || hasNew
-        let fences = rescanned ? scanFences(ns) : shifted
+        let fences = touchedOld || hasNew
+            ? Fences.scan(ns)
+            : fenceLines.map { $0.location >= edit.oldEnd ? NSRange(location: $0.location + delta, length: $0.length) : $0 }
         fenceLines = fences
+        let old = blocks
+        blocks = makeBlocks(fences, length: ns.length, reusing: old, edit: edit)
 
-        // Which lines are fences can change without the count changing (a closer
-        // that gets text after its backticks stops closing): compare positions.
-        // Fence lines inside the edited range are restyled anyway (typing "```swift"
-        // stays cheap); any other difference re-pairs the blocks below.
-        let outside = { (f: NSRange) in NSIntersectionRange(f, range).length == 0 && f.location != range.location }
-        let countChanged = fences.count != fenceCount
-            || (rescanned && fences.filter(outside) != shifted.filter(outside))
-        if countChanged {
-            // Pairing shifted: everything from here down may flip in/out of code.
-            range = NSRange(location: range.location, length: ns.length - range.location)
-        }
-        rebuildBlocks(fences, length: ns.length, keepAllTokens: !countChanged, keepBefore: range.location)
-        // An edit touching a fence line restyles the whole block it belongs to.
-        if fences.contains(where: { NSIntersectionRange($0, range).length > 0 || $0.location == range.location }) {
-            for b in blocks where NSIntersectionRange(b.range, range).length > 0 || b.range.location == range.location {
-                range = NSUnionRange(range, b.range)
+        // Lines outside the edit only need restyling where they changed role
+        // (prose ↔ code, fence ↔ body, or which block they belong to).
+        var need = flips(from: old, to: blocks, edit: edit)
+        need.insert(integersIn: edit.start..<edit.newEnd)
+        need.formUnion(stale)
+
+        var now = need
+        if need.count > Self.syncLimit {
+            // Roles before the edit never change, so what's on screen is around
+            // and below it: the edit's start, and its end (where the caret lands).
+            let w = Self.syncWindow
+            var window = IndexSet(integersIn: edit.start..<min(ns.length, edit.start + w))
+            window.insert(integersIn: max(edit.start, edit.newEnd - w)..<min(ns.length, edit.newEnd + w))
+            now = IndexSet()
+            for r in need.intersection(window).rangeView {
+                let para = ns.paragraphRange(for: NSRange(location: r.lowerBound, length: r.count))
+                now.insert(integersIn: para.location..<NSMaxRange(para))
             }
         }
-        style(s, range: range)
-        return range
+        pending = need.subtracting(now)
+        // Deferred text is collapsed first, so styling the rest doesn't pay for
+        // its attribute runs (see `collapse`).
+        for r in pending.subtracting(stale).rangeView { collapse(s, NSRange(location: r.lowerBound, length: r.count)) }
+        for r in now.rangeView { styleNow(s, NSRange(location: r.lowerBound, length: r.count), fix: true) }
+        schedulePending()
     }
 
     func restyleAll(_ s: NSMutableAttributedString) {
+        target = s
         let ns = s.mutableString
-        fenceCount = -1
-        fenceLines = scanFences(ns)
-        rebuildBlocks(fenceLines, length: ns.length, keepAllTokens: false, keepBefore: 0)
-        style(s, range: NSRange(location: 0, length: ns.length))
+        fenceLines = Fences.scan(ns)
+        blocks = makeBlocks(fenceLines, length: ns.length, reusing: [], edit: nil)
+        mayHaveAttachments = ns.range(of: "\u{FFFC}", options: .literal).location != NSNotFound
+        let all = NSRange(location: 0, length: ns.length)
+        pending = IndexSet()
+        if all.length <= Self.syncLimit {
+            style(s, range: all)
+            return
+        }
+        pending.insert(integersIn: 0..<all.length)
+        collapse(s, all)
+        schedulePending()
+    }
+
+    // MARK: Deferred passes
+
+    /// Styles pending text for up to `budget` seconds, what's visible first.
+    func stylePending(budget: TimeInterval, maxChunks: Int = .max) {
+        guard let s = target, !pending.isEmpty else { return }
+        let deadline = Date().addingTimeInterval(budget)
+        let visible = visibleRange?()
+        let fix = !(s is NSTextStorage)   // a storage fixes fonts itself (see deferredEdit)
+        deferredEdit(s) {
+            if let visible, let r = Range(visible) {
+                for v in pending.intersection(IndexSet(integersIn: r)).rangeView { styleNow(s, NSRange(location: v.lowerBound, length: v.count), fix: fix) }
+            }
+            var chunks = 0
+            while let first = pending.rangeView.first, chunks < maxChunks, Date() < deadline {
+                styleNow(s, NSRange(location: first.lowerBound, length: min(first.count, 1_000)), fix: fix)
+                chunks += 1
+            }
+        }
+        schedulePending()
+    }
+
+    /// Styles everything still pending (tests; anything that needs the final attributes now).
+    func flushPending() {
+        guard let s = target, !pending.isEmpty else { return }
+        let fix = !(s is NSTextStorage)
+        deferredEdit(s) {
+            while let first = pending.rangeView.first {
+                styleNow(s, NSRange(location: first.lowerBound, length: first.count), fix: fix)
+            }
+        }
+    }
+
+    /// Styles whatever of `r` is still pending, now.
+    func styleNow(_ r: NSRange, in s: NSTextStorage) {
+        guard let range = Range(r) else { return }
+        let todo = pending.intersection(IndexSet(integersIn: range))
+        guard !todo.isEmpty else { return }
+        deferredEdit(s) {
+            for v in todo.rangeView { styleNow(s, NSRange(location: v.lowerBound, length: v.count), fix: false) }
+        }
+    }
+
+    /// Styles pending text that's on screen (before it's drawn).
+    func styleVisiblePending() {
+        guard !pending.isEmpty, let visible = visibleRange?(), let s = target as? NSTextStorage else { return }
+        styleNow(visible, in: s)
+    }
+
+    /// Called before `r` is replaced. NSTextView's undo keeps a copy of the
+    /// replaced text with its attributes, and putting back a copy with hundreds
+    /// of thousands of attribute runs takes AppKit seconds (it inserts them one
+    /// by one). Reduced to its base look, the copy is a few runs; the text is
+    /// restyled whenever it comes back. If the edit doesn't happen after all,
+    /// `r` is simply restyled later.
+    func simplifyBeforeReplacing(_ s: NSMutableAttributedString, _ r: NSRange) {
+        guard r.length >= Self.simplifyThreshold, NSMaxRange(r) <= s.length else { return }
+        target = s
+        collapse(s, r)
+        pending.insert(integersIn: r.location..<NSMaxRange(r))
+        schedulePending()
+    }
+    static var simplifyThreshold = 20_000
+
+    /// Runs deferred styling as one storage edit. Afterwards the storage's font
+    /// fixing (fallback fonts for emoji, CJK) is done for what was styled, right
+    /// away: left to happen lazily, the next keystrokes paid for it.
+    private func deferredEdit(_ s: NSMutableAttributedString, _ work: () -> Void) {
+        let storage = s as? NSTextStorage
+        styledSpan = nil
+        storage?.beginEditing()
+        work()
+        storage?.endEditing()
+        if let storage, let span = styledSpan, NSMaxRange(span) <= storage.length { storage.ensureAttributesAreFixed(in: span) }
+        styledSpan = nil
+    }
+
+    private func schedulePending() {
+        guard !pending.isEmpty, !pumpScheduled else { return }
+        pumpScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pumpScheduled = false
+            self.stylePending(budget: Self.chunkBudget)
+        }
+    }
+
+    /// Styles the paragraphs covering `r`. `fix` re-runs AppKit's font fallback
+    /// (emoji, CJK) there; inside a beginEditing/endEditing pair the storage
+    /// does that itself, once, for everything edited. Only the font part:
+    /// paragraph styles and attachments are already consistent, and the full
+    /// fixAttributes(in:) also checks glyph-info attributes in a way that walks
+    /// every attribute run of the page (milliseconds per keystroke on big pages).
+    private func styleNow(_ s: NSMutableAttributedString, _ r: NSRange, fix: Bool) {
+        let para = s.mutableString.paragraphRange(for: r)
+        if para.length > 0 {
+            style(s, range: para)
+            if fix { s.fixFontAttribute(in: para) }
+            styledSpan = styledSpan.map { NSUnionRange($0, para) } ?? para
+        }
+        pending.remove(integersIn: para.location..<max(para.location, NSMaxRange(para)))
+    }
+
+    /// Resets deferred text to its block's base look (body or code) in one
+    /// attribute run. Restyling text in place costs time proportional to the
+    /// attribute runs after it (they're stored in an array), so restyling a long
+    /// stretch of already-styled text near the top of a page was quadratic.
+    /// Attachments and their Markdown source are kept.
+    private func collapse(_ s: NSMutableAttributedString, _ r: NSRange) {
+        guard r.length > 0 else { return }
+        let attachments = savedAttachments(s, in: r)
+        var loc = r.location
+        let end = NSMaxRange(r)
+        var bi = 0
+        while bi < blocks.count, NSMaxRange(blocks[bi].range) <= loc { bi += 1 }
+        while loc < end {
+            if bi < blocks.count, blocks[bi].range.location <= loc {
+                let stop = min(end, NSMaxRange(blocks[bi].range))
+                var attrs = codeAttributes
+                attrs[.jotCodeRegion] = blocks[bi].token
+                s.setAttributes(attrs, range: NSRange(location: loc, length: stop - loc))
+                loc = stop
+                bi += 1
+            } else {
+                let stop = bi < blocks.count ? min(end, blocks[bi].range.location) : end
+                s.setAttributes(typingAttributes, range: NSRange(location: loc, length: stop - loc))
+                loc = stop
+            }
+        }
+        restore(attachments, in: s)
     }
 
     // MARK: Fences
 
-    private func scanFences(_ ns: NSString) -> [NSRange] { Fences.scan(ns) }
+    /// The edited paragraphs: [start, oldEnd) before the edit, [start, newEnd) after.
+    private struct Edit {
+        let start: Int, oldEnd: Int, newEnd: Int
+        var delta: Int { newEnd - oldEnd }
+        /// Where a position before the edit is now; nil inside the edited paragraphs.
+        func map(_ p: Int) -> Int? { p < start ? p : (p >= oldEnd ? p + delta : nil) }
+    }
 
-    private func rebuildBlocks(_ fences: [NSRange], length: Int, keepAllTokens: Bool, keepBefore: Int) {
-        let old = blocks
+    /// Pairs fence lines into blocks. A block keeps its token (so its lines
+    /// needn't be restyled) when its opening fence is the same line as before.
+    private func makeBlocks(_ fences: [NSRange], length: Int, reusing old: [Block], edit: Edit?) -> [Block] {
+        var byOpen: [Int: CodeRegion] = [:]
+        var edited: [CodeRegion] = []   // blocks whose opener was in the edited paragraphs
+        if let edit {
+            for b in old {
+                if let p = edit.map(b.open.location) { byOpen[p] = b.token } else { edited.append(b.token) }
+            }
+        }
         var new: [Block] = []
         var i = 0
         while i < fences.count {
             let open = fences[i]
             let close = i + 1 < fences.count ? fences[i + 1] : nil
             let end = close.map(NSMaxRange) ?? length   // unclosed: runs to the end
-            let idx = new.count
-            let reuse = idx < old.count && (keepAllTokens || open.location < keepBefore)
-            let token = reuse ? old[idx].token : CodeRegion()
-            token.closed = close != nil
+            var token: CodeRegion?
+            if let edit, open.location >= edit.start, open.location < edit.newEnd {
+                if !edited.isEmpty { token = edited.removeFirst() }
+            } else {
+                token = byOpen.removeValue(forKey: open.location)
+            }
+            let t = token ?? CodeRegion()
+            t.closed = close != nil
             new.append(Block(range: NSRange(location: open.location, length: end - open.location),
-                             open: open, close: close, token: token))
+                             open: open, close: close, token: t))
             i += 2
         }
-        blocks = new
-        fenceCount = fences.count
+        return new
+    }
+
+    /// A stretch of lines that all style the same way inside code: a fence line or a block body.
+    private struct Segment { var range: NSRange; var token: ObjectIdentifier; var fence: Bool }
+
+    private func segments(_ blocks: [Block]) -> [Segment] {
+        var out: [Segment] = []
+        for b in blocks {
+            let t = ObjectIdentifier(b.token)
+            out.append(Segment(range: b.open, token: t, fence: true))
+            let bodyEnd = b.close?.location ?? NSMaxRange(b.range)
+            if bodyEnd > NSMaxRange(b.open) {
+                out.append(Segment(range: NSRange(location: NSMaxRange(b.open), length: bodyEnd - NSMaxRange(b.open)), token: t, fence: false))
+            }
+            if let c = b.close { out.append(Segment(range: c, token: t, fence: true)) }
+        }
+        return out
+    }
+
+    /// Characters outside the edit whose role differs between the old and new blocks.
+    private func flips(from old: [Block], to new: [Block], edit: Edit) -> IndexSet {
+        // Old segments in new coordinates, minus the edited paragraphs.
+        var a: [Segment] = []
+        for seg in segments(old) {
+            let lo = seg.range.location, hi = NSMaxRange(seg.range)
+            if lo < edit.start { a.append(Segment(range: NSRange(location: lo, length: min(hi, edit.start) - lo), token: seg.token, fence: seg.fence)) }
+            if hi > edit.oldEnd {
+                let l = max(lo, edit.oldEnd)
+                a.append(Segment(range: NSRange(location: l + edit.delta, length: hi - l), token: seg.token, fence: seg.fence))
+            }
+        }
+        var b: [Segment] = []
+        for seg in segments(new) {
+            let lo = seg.range.location, hi = NSMaxRange(seg.range)
+            if lo < edit.start { b.append(Segment(range: NSRange(location: lo, length: min(hi, edit.start) - lo), token: seg.token, fence: seg.fence)) }
+            if hi > edit.newEnd {
+                let l = max(lo, edit.newEnd)
+                b.append(Segment(range: NSRange(location: l, length: hi - l), token: seg.token, fence: seg.fence))
+            }
+        }
+        var covA = IndexSet(), covB = IndexSet()
+        for s in a where s.range.length > 0 { covA.insert(integersIn: s.range.location..<NSMaxRange(s.range)) }
+        for s in b where s.range.length > 0 { covB.insert(integersIn: s.range.location..<NSMaxRange(s.range)) }
+        var out = covA.symmetricDifference(covB)
+        var i = 0, j = 0
+        while i < a.count, j < b.count {
+            let x = a[i], y = b[j]
+            let lo = max(x.range.location, y.range.location), hi = min(NSMaxRange(x.range), NSMaxRange(y.range))
+            if lo < hi, x.token != y.token || x.fence != y.fence { out.insert(integersIn: lo..<hi) }
+            if NSMaxRange(x.range) <= NSMaxRange(y.range) { i += 1 } else { j += 1 }
+        }
+        return out
     }
 
     // MARK: Paragraph styling
@@ -363,17 +626,35 @@ final class MarkdownStyler {
     private func applyTrait(_ trait: NSFontTraitMask, _ s: NSMutableAttributedString, _ r: NSRange) {
         s.enumerateAttribute(.font, in: r) { value, sub, _ in
             guard let f = value as? NSFont else { return }
-            s.addAttribute(.font, value: NSFontManager.shared.convert(f, toHaveTrait: trait), range: sub)
+            s.addAttribute(.font, value: self.font(f, with: trait), range: sub)
         }
+    }
+
+    /// NSFontManager's conversion is slow and styling asks for the same few fonts over and over.
+    private var traitCache: [UInt: [NSFont: NSFont]] = [:]
+    private func font(_ f: NSFont, with trait: NSFontTraitMask) -> NSFont {
+        if let hit = traitCache[trait.rawValue]?[f] { return hit }
+        let converted = NSFontManager.shared.convert(f, toHaveTrait: trait)
+        traitCache[trait.rawValue, default: [:]][f] = converted
+        return converted
     }
 
     // MARK: Attachments survive restyling
 
+    /// Found through their U+FFFC characters: reading attributes across a big
+    /// range would first make the storage fix (font fallback) all of it.
     private func savedAttachments(_ s: NSMutableAttributedString, in r: NSRange) -> [(Int, NSTextAttachment, Any?)] {
         var out: [(Int, NSTextAttachment, Any?)] = []
-        s.enumerateAttribute(.attachment, in: r) { value, sub, _ in
-            guard let a = value as? NSTextAttachment else { return }
-            out.append((sub.location, a, s.attribute(.jotSource, at: sub.location, effectiveRange: nil)))
+        guard mayHaveAttachments else { return out }
+        let ns = s.mutableString
+        var loc = r.location
+        while loc < NSMaxRange(r) {
+            let hit = ns.range(of: "\u{FFFC}", options: .literal, range: NSRange(location: loc, length: NSMaxRange(r) - loc))
+            guard hit.location != NSNotFound else { break }
+            if let a = s.attribute(.attachment, at: hit.location, effectiveRange: nil) as? NSTextAttachment {
+                out.append((hit.location, a, s.attribute(.jotSource, at: hit.location, effectiveRange: nil)))
+            }
+            loc = NSMaxRange(hit)
         }
         return out
     }

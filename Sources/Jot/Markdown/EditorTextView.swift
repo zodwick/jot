@@ -199,6 +199,52 @@ final class EditorTextView: NSTextView {
         return textFont(loc - 1) ?? textFont(loc) ?? fallback
     }
 
+    // MARK: Deferred styling
+
+    override func shouldChangeText(inRanges affectedRanges: [NSValue], replacementStrings: [String]?) -> Bool {
+        if replacementStrings != nil, let s = textStorage {
+            for r in affectedRanges { styler?.simplifyBeforeReplacing(s, r.rangeValue) }
+        }
+        return super.shouldChangeText(inRanges: affectedRanges, replacementStrings: replacementStrings)
+    }
+
+    /// Characters on screen, or nil outside a scroll view (nothing to prioritise).
+    func visibleCharacterRange() -> NSRange? {
+        guard let lm = layoutManager, let tc = textContainer, enclosingScrollView != nil,
+              let s = textStorage, s.length > 0 else { return nil }
+        var rect = visibleRect
+        guard !rect.isEmpty else { return nil }
+        rect.origin.x -= textContainerOrigin.x
+        rect.origin.y -= textContainerOrigin.y
+        let glyphs = lm.glyphRange(forBoundingRect: rect, in: tc)
+        return lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+    }
+
+    /// Text scrolled into view before its deferred restyle ran gets styled right
+    /// away, before the scroll is drawn. (Styling it from viewWillDraw is too
+    /// late for that frame: the restyle resizes the view mid-draw. That stays
+    /// only as a backstop.)
+    @objc private func clipBoundsChanged() {
+        // Not from inside an edit (an edit's own resize scrolls the clip view):
+        // the storage can't take another edit then; the edit styles its own surroundings.
+        guard textStorage?.editedMask.isEmpty != false else { return }
+        styler?.styleVisiblePending()
+    }
+
+    override func viewWillDraw() {
+        styler?.styleVisiblePending()
+        super.viewWillDraw()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
+        if let clip = superview as? NSClipView {
+            NotificationCenter.default.addObserver(self, selector: #selector(clipBoundsChanged),
+                                                   name: NSView.boundsDidChangeNotification, object: clip)
+        }
+    }
+
     override func didChangeText() {
         super.didChangeText()
         setNeedsCaretUpdate()
@@ -904,14 +950,19 @@ final class EditorTextView: NSTextView {
     /// range and the caret lands where the change was, not at the line's end).
     private func replace(_ range: NSRange, with str: String, caret: Int? = nil) {
         let caret = caret ?? range.location + (str as NSString).length
-        let old = Array(ns.substring(with: range)), new = Array(str)
+        // Compared as UTF-16 (fast on a whole page), then widened to whole
+        // composed characters so an edit never splits an emoji or accent.
+        let oldNS = ns.substring(with: range) as NSString, newNS = str as NSString
+        let old = Array((oldNS as String).utf16), new = Array(str.utf16)
+        func splits(_ s: NSString, _ i: Int) -> Bool { i > 0 && i < s.length && s.rangeOfComposedCharacterSequence(at: i).location != i }
         var head = 0
         while head < old.count, head < new.count, old[head] == new[head] { head += 1 }
+        while splits(oldNS, head) || splits(newNS, head) { head -= 1 }
         var tail = 0
         while tail < old.count - head, tail < new.count - head, old[old.count - 1 - tail] == new[new.count - 1 - tail] { tail += 1 }
-        let headLen = String(old[..<head]).utf16.count
-        let oldMid = String(old[head..<(old.count - tail)]), newMid = String(new[head..<(new.count - tail)])
-        let r = NSRange(location: range.location + headLen, length: oldMid.utf16.count)
+        while tail > 0, splits(oldNS, old.count - tail) || splits(newNS, new.count - tail) { tail -= 1 }
+        let r = NSRange(location: range.location + head, length: old.count - tail - head)
+        let newMid = newNS.substring(with: NSRange(location: head, length: new.count - tail - head))
         guard r.length > 0 || !newMid.isEmpty else {
             setSelectedRange(NSRange(location: caret, length: 0))
             return
@@ -920,8 +971,13 @@ final class EditorTextView: NSTextView {
     }
 
     private func replace(_ range: NSRange, with str: NSAttributedString, caret: Int? = nil) {
-        guard let s = textStorage, shouldChangeText(in: range, replacementString: str.string) else { return }
+        guard let s = textStorage else { return }
+        // One storage edit: preparing a big range for undo (shouldChangeText)
+        // then costs no layout pass of its own.
+        s.beginEditing()
+        guard shouldChangeText(in: range, replacementString: str.string) else { s.endEditing(); return }
         s.replaceCharacters(in: range, with: str)
+        s.endEditing()
         didChangeText()
         setSelectedRange(NSRange(location: caret ?? range.location + str.length, length: 0))
         scrollRangeToVisible(selectedRange())

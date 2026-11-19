@@ -101,7 +101,7 @@ enum Fences {
     /// separators (U+2028/2029/0085) and lone "\r" would otherwise give lines that
     /// NSString's line and paragraph ranges disagree about.
     static func normalizeNewlines(_ s: String) -> String {
-        guard s.contains(where: { $0 == "\r" || $0 == "\r\n" || $0 == "\u{2028}" || $0 == "\u{2029}" || $0 == "\u{85}" }) else { return s }
+        guard s.utf16.contains(where: { $0 == 13 || $0 == 0x2028 || $0 == 0x2029 || $0 == 0x85 }) else { return s }
         return s.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
             .replacingOccurrences(of: "\u{2028}", with: "\n")

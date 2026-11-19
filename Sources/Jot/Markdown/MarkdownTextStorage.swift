@@ -19,10 +19,9 @@ final class MarkdownStylingDelegate: NSObject, NSTextStorageDelegate {
     func textStorage(_ textStorage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
                      range editedRange: NSRange, changeInLength delta: Int) {
         guard editedMask.contains(.editedCharacters) else { return }
-        let restyled = styler.restyle(textStorage, edited: editedRange, delta: delta)
-        // AppKit's font fallback (emoji, CJK, symbols) already ran on the old
-        // attributes; run it again over what we just restyled.
-        textStorage.fixAttributes(in: restyled)
+        // Also re-runs AppKit's font fallback (emoji, CJK, symbols) over what it
+        // restyles: that already ran here, on the old attributes.
+        styler.restyle(textStorage, edited: editedRange, delta: delta)
     }
 }
 

@@ -277,8 +277,118 @@ enum SelfTest {
             let t1 = Date()
             for _ in 0..<50 { stack.textView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0)) }
             let typeMs = Date().timeIntervalSince(t1) * 1000 / 50
-            print(String(format: "perf: load 20k lines %.0f ms, per keystroke %.2f ms", loadMs, typeMs))
-            if typeMs < 16 { passed += 1 } else { failures += 1; print("FAIL keystroke too slow") }
+            // Again once the rest of the page is styled (what you type into a moment after launch).
+            stack.finishStyling()
+            let t2 = Date()
+            for _ in 0..<50 { stack.textView.insertText("y", replacementRange: NSRange(location: NSNotFound, length: 0)) }
+            let styledMs = Date().timeIntervalSince(t2) * 1000 / 50
+            print(String(format: "perf: load 20k lines %.0f ms, per keystroke %.2f ms (%.2f ms once fully styled)", loadMs, typeMs, styledMs))
+            if typeMs < 16, styledMs < 16 { passed += 1 } else { failures += 1; print("FAIL keystroke too slow") }
+        }
+
+        // Big page: opening or closing a fence restyles only what changed role
+        // near the edit; the rest of the page is styled afterwards in chunks.
+        // (Restyling everything below took ~650 ms to open, ~900 ms for Return.)
+        do {
+            let para = "Some prose with a https://example.com link, **bold**, _italic_ and `code` here.\n"
+            let stack = MarkdownEditorStack()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
+                                  styleMask: [.titled], backing: .buffered, defer: true)
+            let scroll = NSScrollView(frame: window.contentView!.bounds)
+            scroll.documentView = stack.textView
+            stack.textView.frame = NSRect(x: 0, y: 0, width: 560, height: 680)
+            window.contentView = scroll
+            stack.load(markdown: "intro\n\n" + String(repeating: para, count: 20_000))
+            stack.finishStyling()
+            let tv = stack.textView
+            func ms(_ f: () -> Void) -> Double { let t = Date(); f(); return Date().timeIntervalSince(t) * 1000 }
+            func key(_ s: String) { tv.insertText(s, replacementRange: NSRange(location: NSNotFound, length: 0)) }
+            // Best of three, so a busy machine doesn't fail it; the old code took 650-900 ms.
+            var open = Double.infinity, info = Double.infinity, close = Double.infinity, reopen = Double.infinity
+            for _ in 0..<3 {
+                tv.setSelectedRange(NSRange(location: 6, length: 0))
+                open = min(open, (0..<3).map { _ in ms { key("`") } }.max()!)   // the third one opens a block to the end
+                info = min(info, ms { key("j") })
+                close = min(close, ms { tv.insertNewline(nil) })                // auto-closes: everything below is prose again
+                stack.finishStyling()
+                // "intro\n```j\n\n```\nSome…": backspace at the end of the closing fence
+                // makes it "``", so the block is open to the end of the page again.
+                tv.setSelectedRange(NSRange(location: 15, length: 0))
+                reopen = min(reopen, ms { tv.deleteBackward(nil) })
+                stack.finishStyling()
+                tv.insertText("", replacementRange: NSRange(location: 6, length: 8))   // back to "intro\n\nSome…"
+                stack.finishStyling()
+            }
+            let unchanged = stack.markdown() == "intro\n\n" + String(repeating: para, count: 20_000)
+            print(String(format: "perf: fence open %.1f ms, info string %.1f ms, Return auto-close %.1f ms, backspace %.1f ms", open, info, close, reopen))
+            #if DEBUG
+            let limit: Double = 32   // unoptimised build; release stays under 16
+            #else
+            let limit: Double = 16
+            #endif
+            for (name, v) in [("open", open), ("info string", info), ("Return", close), ("backspace", reopen)] {
+                if v < limit, unchanged { passed += 1 } else { failures += 1; print("FAIL fence \(name) keystroke too slow: \(v) ms (text intact: \(unchanged))") }
+            }
+        }
+
+        // Deferred styling stays correct when you keep editing before it finishes:
+        // once it's done, every character looks exactly as after a fresh load.
+        do {
+            func fingerprint(_ s: NSTextStorage) -> [String] {
+                var out: [String] = []
+                var tokens: [ObjectIdentifier: Int] = [:]
+                s.enumerateAttributes(in: NSRange(location: 0, length: s.length)) { a, r, _ in
+                    var t = "-"
+                    if let c = a[.jotCodeRegion] as? CodeRegion {
+                        let id = ObjectIdentifier(c)
+                        if tokens[id] == nil { tokens[id] = tokens.count }
+                        t = "C\(tokens[id]!)\(c.closed ? "c" : "o")"
+                    }
+                    let f = (a[.font] as? NSFont).map { "\($0.pointSize)\($0.isFixedPitch ? "m" : "")\(NSFontManager.shared.traits(of: $0).rawValue)" } ?? "-"
+                    let flags = [a[.jotFence] != nil, a[.jotHidden] != nil, a[.jotPrefix] != nil, a[.jotMarker] != nil, a[.link] != nil, a[.jotQuote] != nil]
+                        .map { $0 ? "1" : "0" }.joined()
+                    let entry = "\(t)|\(flags)|\(f)"
+                    if out.last?.hasPrefix(entry + "@") == true { return }   // runs split by keys we don't compare
+                    out.append(entry + "@\(r.location)")
+                }
+                return out
+            }
+            let section = "## Notes\n- item with **bold**\n- [ ] task\n> quoted\nplain text with `code` and a [link](https://x.org)\n![](attachments/a.png) and [r.pdf](attachments/r.pdf)\n```swift\nlet x = 1\n```\n\n"
+            let page = String(repeating: section, count: 400)   // ~40k characters: more than is styled at once
+            let stack = MarkdownEditorStack()
+            stack.load(markdown: page)
+            let tv = stack.textView
+            func key(_ s: String) { tv.insertText(s, replacementRange: NSRange(location: NSNotFound, length: 0)) }
+            let deferredAfterLoad = !stack.styler.pending.isEmpty
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
+            key("```\n")                                              // opens a block: every pair below flips
+            stack.styler.stylePending(budget: 1, maxChunks: 3)
+            tv.setSelectedRange(NSRange(location: 20_000, length: 0))
+            key("x"); tv.insertNewline(nil); key("```")
+            stack.styler.stylePending(budget: 1, maxChunks: 2)
+            tv.setSelectedRange(NSRange(location: 4, length: 0))
+            tv.deleteBackward(nil)                                     // the opener is gone again
+            tv.setSelectedRange(NSRange(location: 30_000, length: 0))
+            tv.insertNewline(nil)
+            stack.setBaseFontSize(16)                                  // restyles the whole page, deferred
+            let duringFontChange = stack.markdown()                    // saving mid-pass keeps every attachment
+            stack.finishStyling()
+            // The same characters and attachments, styled from scratch. (Not a load of
+            // the Markdown: an image that ends up inside a code block while you edit
+            // stays an image, where a load keeps it as text. That's unrelated to this.)
+            let fresh = MarkdownEditorStack()
+            fresh.setBaseFontSize(16)
+            fresh.storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: NSAttributedString(attributedString: stack.storage))
+            fresh.finishStyling()
+            let atoms = duringFontChange.components(separatedBy: "](attachments/").count - 1
+            if deferredAfterLoad, stack.styler.pending.isEmpty, fingerprint(stack.storage) == fingerprint(fresh.storage),
+               duringFontChange == stack.markdown(), atoms == 800 { passed += 1 }
+            else {
+                failures += 1
+                let a = fingerprint(stack.storage), b = fingerprint(fresh.storage)
+                let i = (0..<min(a.count, b.count)).first { a[$0] != b[$0] } ?? min(a.count, b.count)
+                print("FAIL deferred styling differs from a fresh load (deferred: \(deferredAfterLoad), attachments: \(atoms), same text: \(duringFontChange == stack.markdown()), first diff: \(i < a.count ? a[i] : "-") vs \(i < b.count ? b[i] : "-"))")
+            }
         }
 
         print("selftest: \(passed) passed, \(failures) failed")

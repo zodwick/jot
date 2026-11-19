@@ -129,7 +129,15 @@ final class MarkdownLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
             guard let token = value as? CodeRegion, seen.insert(ObjectIdentifier(token)).inserted else { return }
             var region = NSRange()
             _ = storage.attribute(.jotCodeRegion, at: run.location, longestEffectiveRange: &region, in: full)
-            guard let (top, bottom) = self.fragmentBounds(forCharacterRange: region), bottom > top else { return }
+            // Measure only the part being drawn: locating the far end of a long
+            // block (an unclosed one runs to the end of the page) forces layout
+            // of everything down there. Where the block goes on past what's
+            // drawn, its rounded edge is pushed outside the clip.
+            let start = max(region.location, chars.location), end = min(NSMaxRange(region), NSMaxRange(chars))
+            guard end > start, var (top, bottom) = self.fragmentBounds(forCharacterRange: NSRange(location: start, length: end - start)),
+                  bottom > top else { return }
+            if region.location < start { top -= 16 }
+            if NSMaxRange(region) > end { bottom += 16 }
             let box = NSRect(x: origin.x + pad, y: origin.y + top, width: container.size.width - pad * 2, height: bottom - top)
             NSColor.labelColor.withAlphaComponent(0.06).setFill()
             NSBezierPath(roundedRect: box, xRadius: 8, yRadius: 8).fill()
