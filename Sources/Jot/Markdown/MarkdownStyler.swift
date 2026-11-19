@@ -69,18 +69,29 @@ final class MarkdownStyler {
     func restyle(_ s: NSMutableAttributedString, edited: NSRange, delta: Int) -> NSRange {
         let ns = s.mutableString
         var range = ns.paragraphRange(for: edited)
+        // An edit ending in a newline (Return mid-line, a pasted line) made a new
+        // paragraph out of the text after it; restyle that one too.
+        if NSMaxRange(edited) == NSMaxRange(range), NSMaxRange(range) < ns.length {
+            range = NSUnionRange(range, ns.paragraphRange(for: NSRange(location: NSMaxRange(range), length: 0)))
+        }
 
         // Fences only need a full rescan when the edited lines had or have one;
         // otherwise the known fence lines just shift by the edit's length.
         let oldStart = range.location, oldEnd = NSMaxRange(range) - delta
         let touchedOld = fenceLines.contains { $0.location <= oldEnd && NSMaxRange($0) > oldStart }
         let hasNew = ns.range(of: "```", options: .literal, range: range).location != NSNotFound
-        let fences = (touchedOld || hasNew)
-            ? scanFences(ns)
-            : fenceLines.map { $0.location >= oldEnd ? NSRange(location: $0.location + delta, length: $0.length) : $0 }
+        let shifted = fenceLines.map { $0.location >= oldEnd ? NSRange(location: $0.location + delta, length: $0.length) : $0 }
+        let rescanned = touchedOld || hasNew
+        let fences = rescanned ? scanFences(ns) : shifted
         fenceLines = fences
 
+        // Which lines are fences can change without the count changing (a closer
+        // that gets text after its backticks stops closing): compare positions.
+        // Fence lines inside the edited range are restyled anyway (typing "```swift"
+        // stays cheap); any other difference re-pairs the blocks below.
+        let outside = { (f: NSRange) in NSIntersectionRange(f, range).length == 0 && f.location != range.location }
         let countChanged = fences.count != fenceCount
+            || (rescanned && fences.filter(outside) != shifted.filter(outside))
         if countChanged {
             // Pairing shifted: everything from here down may flip in/out of code.
             range = NSRange(location: range.location, length: ns.length - range.location)
@@ -106,22 +117,7 @@ final class MarkdownStyler {
 
     // MARK: Fences
 
-    private func scanFences(_ ns: NSString) -> [NSRange] {
-        var result: [NSRange] = []
-        var loc = 0
-        let len = ns.length
-        while loc < len {
-            let r = ns.range(of: "```", options: .literal, range: NSRange(location: loc, length: len - loc))
-            if r.location == NSNotFound { break }
-            let line = ns.lineRange(for: NSRange(location: r.location, length: 0))
-            let lead = r.location - line.location
-            if lead <= 3, lead == 0 || ns.substring(with: NSRange(location: line.location, length: lead)).allSatisfy({ $0 == " " }) {
-                result.append(line)
-            }
-            loc = NSMaxRange(line)
-        }
-        return result
-    }
+    private func scanFences(_ ns: NSString) -> [NSRange] { Fences.scan(ns) }
 
     private func rebuildBlocks(_ fences: [NSRange], length: Int, keepAllTokens: Bool, keepBefore: Int) {
         let old = blocks
@@ -187,7 +183,17 @@ final class MarkdownStyler {
         ], range: para)
         if isFence {
             s.addAttribute(.jotFence, value: true, range: para)
-            if line.length > 0 { s.addAttribute(.jotHidden, value: true, range: line) }
+            guard line.length > 0 else { return }
+            // Hide the backticks; a language tag ("```swift") stays visible, quietly.
+            let ns = s.mutableString
+            var end = line.location
+            while end < NSMaxRange(line), ns.character(at: end) == 32 || ns.character(at: end) == 96 { end += 1 }
+            s.addAttribute(.jotHidden, value: true, range: NSRange(location: line.location, length: end - line.location))
+            if end < NSMaxRange(line) {
+                s.addAttributes([.foregroundColor: NSColor.tertiaryLabelColor,
+                                 .font: NSFont.monospacedSystemFont(ofSize: (monoFont.pointSize * 0.85).rounded(), weight: .regular)],
+                                range: NSRange(location: end, length: NSMaxRange(line) - end))
+            }
         }
     }
 
@@ -315,30 +321,43 @@ final class MarkdownStyler {
             taken.append(NSRange(location: NSMaxRange(text), length: NSMaxRange(m.range) - NSMaxRange(text)))
         }
 
-        for m in all(MarkdownPatterns.bold, range) where free(m.range) {
-            let mk = m.range(at: 1).length
-            hide(NSRange(location: m.range.location, length: mk))
-            hide(NSRange(location: NSMaxRange(m.range) - mk, length: mk))
-            applyTrait(.boldFontMask, s, m.range(at: 2))
-        }
-        for m in all(MarkdownPatterns.italic, range) where free(m.range) {
-            hide(NSRange(location: m.range.location, length: 1))
-            hide(NSRange(location: NSMaxRange(m.range) - 1, length: 1))
-            applyTrait(.italicFontMask, s, m.range(at: 2))
-        }
-        for m in all(MarkdownPatterns.strike, range) where free(m.range) {
-            hide(NSRange(location: m.range.location, length: 2))
-            hide(NSRange(location: NSMaxRange(m.range) - 2, length: 2))
-            s.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: m.range(at: 1))
-        }
-
+        // Bare URLs before emphasis, so "__dict__" or "/_b_/" inside a URL stay as typed.
         if let detector = MarkdownPatterns.linkDetector {
             for result in all(detector, range) {
                 guard let url = result.url, free(result.range),
                       url.scheme == "http" || url.scheme == "https" || url.scheme == "mailto" else { continue }
                 s.addAttribute(.link, value: url, range: result.range)
+                taken.append(result.range)
             }
         }
+
+        // Emphasis may wrap a link or code span ("**[a](b)**"); only its own markers must be free.
+        func markersFree(_ m: NSTextCheckingResult, _ mk: Int) -> Bool {
+            free(NSRange(location: m.range.location, length: mk)) && free(NSRange(location: NSMaxRange(m.range) - mk, length: mk))
+        }
+        func isWord(_ i: Int) -> Bool {
+            guard i >= 0, i < ns.length, let u = UnicodeScalar(ns.character(at: i)) else { return false }
+            return CharacterSet.alphanumerics.contains(u) || u == "_"
+        }
+        for m in all(MarkdownPatterns.bold, range) where markersFree(m, m.range(at: 1).length) {
+            // "foo__bar__baz" is literal (CommonMark: no intraword "__").
+            if ns.character(at: m.range.location) == 95, isWord(m.range.location - 1) || isWord(NSMaxRange(m.range)) { continue }
+            let mk = m.range(at: 1).length
+            hide(NSRange(location: m.range.location, length: mk))
+            hide(NSRange(location: NSMaxRange(m.range) - mk, length: mk))
+            applyTrait(.boldFontMask, s, m.range(at: 2))
+        }
+        for m in all(MarkdownPatterns.italic, range) where markersFree(m, 1) {
+            hide(NSRange(location: m.range.location, length: 1))
+            hide(NSRange(location: NSMaxRange(m.range) - 1, length: 1))
+            applyTrait(.italicFontMask, s, m.range(at: 2))
+        }
+        for m in all(MarkdownPatterns.strike, range) where markersFree(m, 2) {
+            hide(NSRange(location: m.range.location, length: 2))
+            hide(NSRange(location: NSMaxRange(m.range) - 2, length: 2))
+            s.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: m.range(at: 1))
+        }
+
     }
 
     private func applyTrait(_ trait: NSFontTraitMask, _ s: NSMutableAttributedString, _ r: NSRange) {

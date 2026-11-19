@@ -50,15 +50,64 @@ enum MarkdownPatterns {
     static let list = re(#"^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+)(\[[ xX]\](?=[ \t]|$))?"#)
 
     static let inlineCode = re(#"`([^`\n]+)`"#)
-    static let link = re(#"(?<!!)\[([^\]\n]+)\]\(([^)\s]+)\)"#)
+    /// The URL may contain balanced parentheses (Wikipedia's "C_(programming_language)").
+    static let link = re(#"(?<!!)\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)"#)
     static let bold = re(#"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#)
-    static let italic = re(#"(?<![\*\w])([\*_])(?=[^\s\*_])(.+?)(?<=[^\s\*_])\1(?![\*\w])"#)
+    /// The marker must not be the "*" of a keycap emoji (*️⃣).
+    static let italic = re(#"(?<![\*\w])([\*_])(?![\x{FE0F}\x{20E3}])(?=[^\s\*_])(.+?)(?<=[^\s\*_])\1(?![\*\w\x{FE0F}\x{20E3}])"#)
     static let strike = re(#"~~(?=\S)(.+?)(?<=\S)~~"#)
 
     /// Local images/files that become inline objects: ![alt](path) and [name](attachments/…)
-    static let atom = re(#"(!?)\[([^\]\n]*)\]\(((?:attachments/|file://)[^)\s]+)\)"#)
+    /// The path may contain balanced parentheses ("a(1).png").
+    static let atom = re(#"(!?)\[([^\]\n]*)\]\(((?:attachments/|file://)(?:[^()\s]|\([^()\s]*\))+)\)"#)
 
     static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+}
+
+/// Fenced code blocks, CommonMark-ish: an opening fence's info string has no
+/// backticks ("```x``` inline" is prose), and a closing fence is only backticks,
+/// at least as many as opened it. Returns fence lines in open/close pairs (a
+/// trailing unpaired one is an unclosed block). Shared by styling and Atoms.
+enum Fences {
+    static func scan(_ ns: NSString) -> [NSRange] {
+        var result: [NSRange] = []
+        var openTicks = 0
+        var loc = 0
+        let len = ns.length
+        while loc < len {
+            let r = ns.range(of: "```", options: .literal, range: NSRange(location: loc, length: len - loc))
+            if r.location == NSNotFound { break }
+            let line = ns.paragraphRange(for: NSRange(location: r.location, length: 0))
+            loc = NSMaxRange(line)
+            let lead = r.location - line.location
+            guard lead <= 3, lead == 0 || ns.substring(with: NSRange(location: line.location, length: lead)).allSatisfy({ $0 == " " }) else { continue }
+            var i = r.location
+            while i < NSMaxRange(line), ns.character(at: i) == 96 { i += 1 }
+            let ticks = i - r.location
+            let rest = ns.substring(with: NSRange(location: i, length: NSMaxRange(line) - i))
+            if openTicks == 0 {
+                guard !rest.contains("`") else { continue }
+                openTicks = ticks
+                result.append(line)
+            } else if ticks >= openTicks, rest.allSatisfy({ $0 == " " || $0 == "\t" || $0 == "\n" }) {
+                openTicks = 0
+                result.append(line)
+            }
+        }
+        return result
+    }
+
+    /// Normalises every kind of line break to "\n". Paragraph and line
+    /// separators (U+2028/2029/0085) and lone "\r" would otherwise give lines that
+    /// NSString's line and paragraph ranges disagree about.
+    static func normalizeNewlines(_ s: String) -> String {
+        guard s.contains(where: { $0 == "\r" || $0 == "\r\n" || $0 == "\u{2028}" || $0 == "\u{2029}" || $0 == "\u{85}" }) else { return s }
+        return s.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\u{2028}", with: "\n")
+            .replacingOccurrences(of: "\u{2029}", with: "\n")
+            .replacingOccurrences(of: "\u{85}", with: "\n")
+    }
 }
 
 /// Parsed list prefix of a single line (shared by styler and editor commands).

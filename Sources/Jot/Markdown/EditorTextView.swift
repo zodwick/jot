@@ -24,20 +24,83 @@ final class EditorTextView: NSTextView {
         return r
     }
 
-    /// Never leave the caret inside a block prefix: snap it to where the content starts.
+    /// A line whose text is entirely hidden ("---" drawn as a rule, a bare ``` fence),
+    /// as its content range without the newline. Only its end is a real caret spot.
+    private func hiddenLine(at i: Int) -> NSRange? {
+        guard let s = textStorage, i >= 0, i <= s.length, s.length > 0 else { return nil }
+        let line = ns.lineRange(for: NSRange(location: min(i, s.length), length: 0))
+        var content = line
+        if content.length > 0, ns.character(at: NSMaxRange(content) - 1) == 10 { content.length -= 1 }
+        guard content.length > 0, i <= NSMaxRange(content),
+              s.attribute(.jotRule, at: content.location, effectiveRange: nil) != nil
+                || s.attribute(.jotFence, at: content.location, effectiveRange: nil) != nil else { return nil }
+        var hidden = NSRange()
+        guard s.attribute(.jotHidden, at: content.location, longestEffectiveRange: &hidden, in: content) != nil,
+              NSMaxRange(hidden) >= NSMaxRange(content) else { return nil }
+        return content
+    }
+
+    /// Where a line's content starts (after "- ", "# ", "> " …).
+    private func contentStart(ofLineAt loc: Int) -> Int {
+        let line = ns.lineRange(for: NSRange(location: min(loc, length), length: 0))
+        if let p = prefixRange(at: line.location), p.location == line.location { return NSMaxRange(p) }
+        return line.location
+    }
+
+    /// Never leave the caret inside a block prefix or a hidden line.
     private func snapped(_ loc: Int) -> Int {
         if let p = prefixRange(at: loc), loc < NSMaxRange(p) { return NSMaxRange(p) }
+        if let h = hiddenLine(at: loc) { return NSMaxRange(h) }
         return loc
+    }
+
+    /// Selections never cut a prefix in half: an end inside one moves past it, and a
+    /// start inside one moves to the content (or, for a multi-line selection, to the
+    /// line start so whole lines are taken). Otherwise Shift-⌘-← or a double-click on
+    /// a bullet would select the invisible "- " and deleting would eat the bullet.
+    private func snapped(_ r: NSRange) -> NSRange {
+        guard r.length > 0 else { return NSRange(location: snapped(r.location), length: 0) }
+        var start = r.location, end = NSMaxRange(r)
+        if let p = prefixRange(at: end), end > p.location, end < NSMaxRange(p) { end = NSMaxRange(p) }
+        if let p = prefixRange(at: start), start < NSMaxRange(p) {
+            let line = ns.lineRange(for: NSRange(location: start, length: 0))
+            let lineEnd = NSMaxRange(line) - (NSMaxRange(line) > line.location && ns.character(at: NSMaxRange(line) - 1) == 10 ? 1 : 0)
+            start = end <= lineEnd ? NSMaxRange(p) : line.location
+        }
+        return NSRange(location: start, length: max(0, end - start))
     }
 
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         var ranges = ranges
-        if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
-            let s = snapped(r.location)
-            if s != r.location { ranges = [NSValue(range: NSRange(location: s, length: 0))] }
+        if ranges.count == 1, let r = ranges.first?.rangeValue {
+            let s = snapped(r)
+            if s != r { ranges = [NSValue(range: s)] }
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        resetTypingAttributesOnEmptyLine()
         setNeedsCaretUpdate()
+    }
+
+    /// On an empty line, NSTextView borrows the typing attributes of the newline
+    /// before it (a heading's font, a quote's indent, code styling), so the caret
+    /// and first letter start out wrong. An empty line is plain body text.
+    private func resetTypingAttributesOnEmptyLine() {
+        // Never type with the styler's private attributes (hidden, fence, prefix…)
+        // picked up from the character before the caret.
+        let leaked: [NSAttributedString.Key] = [.jotHidden, .jotPrefix, .jotMarker, .jotRule, .jotFence, .jotInlineCode,
+                                                .jotQuote, .jotSource, .attachment, .link, .kern, .strikethroughStyle]
+        if leaked.contains(where: { typingAttributes[$0] != nil }) {
+            var attrs = typingAttributes
+            for k in leaked { attrs[k] = nil }
+            if (attrs[.foregroundColor] as? NSColor) == NSColor.clear { attrs[.foregroundColor] = NSColor.labelColor }
+            typingAttributes = attrs
+        }
+        guard let styler, selectedRanges.count == 1 else { return }
+        let sel = selectedRange()
+        guard sel.length == 0, !inCodeBlock(sel.location) else { return }
+        let atLineStart = sel.location == 0 || ns.character(at: sel.location - 1) == 10
+        let atLineEnd = sel.location == length || ns.character(at: sel.location) == 10
+        if atLineStart, atLineEnd { typingAttributes = styler.typingAttributes }
     }
 
     // MARK: Text-height cursor
@@ -91,7 +154,9 @@ final class EditorTextView: NSTextView {
 
         let afterLastNewline = s.length == 0 || (loc == s.length && ns.character(at: loc - 1) == 10)
         if afterLastNewline {
-            // Empty page or empty last line: the "extra" line fragment.
+            // Empty page or empty last line: the "extra" line fragment. With
+            // non-contiguous layout it's only an estimate until the end is laid out.
+            if s.length > 0 { lm.ensureLayout(forCharacterRange: NSRange(location: s.length - 1, length: 1)) }
             let extra = lm.extraLineFragmentRect
             let indent = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 0
             x = extra.minX + tc.lineFragmentPadding + indent
@@ -169,40 +234,138 @@ final class EditorTextView: NSTextView {
 
     // MARK: Arrow keys skip invisible characters
 
+    /// One visible step back from `p`: skips hidden markers, steps out of a prefix to
+    /// the previous line's end, and over hidden lines. nil = nowhere to go.
+    private func backwardTarget(from p: Int) -> Int? {
+        guard p > 0 else { return nil }
+        var c = p - 1
+        while c >= 0, isHidden(c) { c -= 1 }
+        guard c >= 0 else { return nil }
+        var t = ns.rangeOfComposedCharacterSequence(at: c).location
+        if let pre = prefixRange(at: t), t < NSMaxRange(pre) {
+            // Stepping back out of a list item / heading goes to the previous line's end.
+            guard pre.location > 0 else { return nil }
+            t = pre.location - 1
+        }
+        while let h = hiddenLine(at: t) {
+            guard h.location > 0 else { return nil }
+            t = h.location - 1
+        }
+        return t
+    }
+
+    /// One visible step forward from `p`.
+    private func forwardTarget(from p: Int) -> Int? {
+        guard p < length else { return nil }
+        var c = p
+        while c < length, isHidden(c) { c += 1 }
+        guard c < length else { return length }
+        var t = snapped(NSMaxRange(ns.rangeOfComposedCharacterSequence(at: c)))
+        // Landing on a collapsed ``` / --- line: carry on to the line after it.
+        while let h = hiddenLine(at: t), NSMaxRange(h) < length, t == NSMaxRange(h), t != p {
+            let next = NSMaxRange(h) + 1
+            let after = snapped(next)
+            if hiddenLine(at: after) == nil || after == t { t = after; break }
+            t = after
+        }
+        return t
+    }
+
+    /// Right-to-left lines keep AppKit's own visual arrow handling.
+    private func lineIsRightToLeft(_ loc: Int) -> Bool {
+        let line = ns.lineRange(for: NSRange(location: min(loc, length), length: 0))
+        let text = ns.substring(with: line)
+        return text.unicodeScalars.contains { (0x0590...0x08FF).contains($0.value) || (0xFB1D...0xFDFF).contains($0.value) || (0xFE70...0xFEFF).contains($0.value) }
+    }
+
+    private func moveCaret(to t: Int?) {
+        guard let t else { return }
+        // Downstream: at a soft wrap the caret belongs to the start of the next line.
+        setSelectedRange(NSRange(location: t, length: 0), affinity: .downstream, stillSelecting: false)
+        scrollRangeToVisible(selectedRange())
+    }
+
+    override func moveBackward(_ sender: Any?) {
+        let sel = selectedRange()
+        guard sel.length == 0 else { return super.moveBackward(sender) }
+        moveCaret(to: backwardTarget(from: sel.location))
+    }
+
+    override func moveForward(_ sender: Any?) {
+        let sel = selectedRange()
+        guard sel.length == 0 else { return super.moveForward(sender) }
+        moveCaret(to: forwardTarget(from: sel.location))
+    }
+
     override func moveLeft(_ sender: Any?) {
         let sel = selectedRange()
-        guard sel.length == 0, sel.location > 0 else { return super.moveLeft(sender) }
-        var c = sel.location - 1
-        while c >= 0, isHidden(c) { c -= 1 }
-        guard c >= 0 else { return }
-        var t = ns.rangeOfComposedCharacterSequence(at: c).location
-        if let p = prefixRange(at: t), t < NSMaxRange(p) {
-            // Stepping left out of a list item / heading goes to the previous line's end.
-            guard p.location > 0 else { return }
-            t = p.location - 1
-        }
-        setSelectedRange(NSRange(location: t, length: 0))
-        scrollRangeToVisible(selectedRange())
+        guard sel.length == 0, !lineIsRightToLeft(sel.location) else { return super.moveLeft(sender) }
+        moveCaret(to: backwardTarget(from: sel.location))
     }
 
     override func moveRight(_ sender: Any?) {
         let sel = selectedRange()
-        guard sel.length == 0, sel.location < length else { return super.moveRight(sender) }
-        var c = sel.location
-        while c < length, isHidden(c) { c += 1 }
-        guard c < length else { setSelectedRange(NSRange(location: length, length: 0)); return }
-        let t = NSMaxRange(ns.rangeOfComposedCharacterSequence(at: c))
-        setSelectedRange(NSRange(location: snapped(t), length: 0))
-        scrollRangeToVisible(selectedRange())
+        guard sel.length == 0, !lineIsRightToLeft(sel.location) else { return super.moveRight(sender) }
+        moveCaret(to: forwardTarget(from: sel.location))
     }
 
-    override func moveBackward(_ sender: Any?) { moveLeft(sender) }
-    override func moveForward(_ sender: Any?) { moveRight(sender) }
+    // Shift-arrows: the moving end steps over hidden characters too, so every press
+    // changes what you see selected. The anchor is the end that didn't move last time.
+    private var extendState: (anchor: Int, head: Int, sel: NSRange)?
+
+    private func extendSelection(backward: Bool) {
+        let sel = selectedRange()
+        var anchor: Int, head: Int
+        if let st = extendState, st.sel == sel {
+            anchor = st.anchor; head = st.head
+        } else {
+            anchor = backward ? NSMaxRange(sel) : sel.location
+            head = backward ? sel.location : NSMaxRange(sel)
+            if sel.length == 0 {
+                // Start from the visible edge: Shift-← after "**bold**" selects "d", not "d**".
+                if backward { while anchor > 0, isInlineMarker(anchor - 1) { anchor -= 1 } }
+                else { while anchor < length, isInlineMarker(anchor) { anchor += 1 } }
+            }
+        }
+        guard let t = backward ? backwardTarget(from: head) : forwardTarget(from: head) else { return }
+        head = t
+        setSelectedRange(NSRange(location: min(anchor, head), length: abs(anchor - head)), affinity: .downstream, stillSelecting: false)
+        extendState = (anchor, head, selectedRange())
+        scrollRangeToVisible(NSRange(location: min(head, length), length: 0))
+    }
+
+    override func moveLeftAndModifySelection(_ sender: Any?) {
+        lineIsRightToLeft(selectedRange().location) ? super.moveLeftAndModifySelection(sender) : extendSelection(backward: true)
+    }
+    override func moveRightAndModifySelection(_ sender: Any?) {
+        lineIsRightToLeft(selectedRange().location) ? super.moveRightAndModifySelection(sender) : extendSelection(backward: false)
+    }
+    override func moveBackwardAndModifySelection(_ sender: Any?) { extendSelection(backward: true) }
+    override func moveForwardAndModifySelection(_ sender: Any?) { extendSelection(backward: false) }
 
     // MARK: Deleting
 
+    /// A hidden inline marker ("**", "`", "](url)"), as opposed to a block prefix or a fence/rule.
+    private func isInlineMarker(_ i: Int) -> Bool {
+        guard isHidden(i), prefixRange(at: i) == nil, hiddenLine(at: i) == nil else { return false }
+        return textStorage?.attribute(.jotFence, at: i, effectiveRange: nil) == nil
+    }
+
+    /// Deleting a selection keeps inline markers balanced: markers at its edges stay,
+    /// and a closing marker inside takes its opening one with it.
+    private func deleteSelectionKeepingMarkers(_ sel: NSRange) -> Bool {
+        var a = sel.location, b = NSMaxRange(sel)
+        while a < b, isInlineMarker(a) { a += 1 }
+        while b > a, isInlineMarker(b - 1) { b -= 1 }
+        guard a != sel.location || b != NSMaxRange(sel) || (sel.location..<NSMaxRange(sel)).contains(where: isInlineMarker) else { return false }
+        if a == b { setSelectedRange(NSRange(location: a, length: 0)); return true }
+        deleteSpan(NSRange(location: a, length: b - a), caret: nil)
+        return true
+    }
+
     override func deleteBackward(_ sender: Any?) {
         let sel = selectedRange()
+        if sel.length > 0, selectedRanges.count == 1, deleteSelectionKeepingMarkers(sel) { return }
         guard sel.length == 0, sel.location > 0 else { return super.deleteBackward(sender) }
         let p = sel.location
 
@@ -211,14 +374,37 @@ final class EditorTextView: NSTextView {
             removePrefix(pre)
             return
         }
+        // At the end of a "---" or ``` line: un-hide it by deleting one character ("--").
+        if let h = hiddenLine(at: p - 1), p == NSMaxRange(h) {
+            replace(NSRange(location: p - 1, length: 1), with: "")
+            return
+        }
+        // At the start of the line after one: a rule goes away; a fence stays (deleting
+        // it would turn everything below into code), the caret just steps over it.
+        if ns.character(at: p - 1) == 10, p >= 2, let h = hiddenLine(at: p - 2) {
+            if textStorage?.attribute(.jotRule, at: h.location, effectiveRange: nil) != nil {
+                replace(NSRange(location: h.location, length: p - h.location), with: "")
+            } else {
+                moveCaret(to: backwardTarget(from: p))
+            }
+            return
+        }
         // Hidden markers right before the caret: delete the visible character before them,
         // so you never silently eat half of a "**" pair.
         if isHidden(p - 1) {
             var c = p - 1
-            while c >= 0, isHidden(c) { c -= 1 }
+            while c >= 0, isHidden(c) {
+                // Walked back into a heading / quote prefix ("# **b**", caret before b).
+                if let pre = prefixRange(at: c) { removePrefix(pre); return }
+                c -= 1
+            }
             guard c >= 0 else { return }
-            if let pre = prefixRange(at: c), NSMaxRange(pre) == c + 1 { removePrefix(pre); return }
-            replace(ns.rangeOfComposedCharacterSequence(at: c), with: "")
+            deleteVisible(ns.rangeOfComposedCharacterSequence(at: c))
+            return
+        }
+        let target = ns.rangeOfComposedCharacterSequence(at: p - 1)
+        if isHidden(target.location - 1), isHidden(NSMaxRange(target)) {
+            deleteVisible(target)   // last letter of a span: take its markers too
             return
         }
         super.deleteBackward(sender)
@@ -226,6 +412,7 @@ final class EditorTextView: NSTextView {
 
     override func deleteForward(_ sender: Any?) {
         let sel = selectedRange()
+        if sel.length > 0, selectedRanges.count == 1, deleteSelectionKeepingMarkers(sel) { return }
         guard sel.length == 0, sel.location < length else { return super.deleteForward(sender) }
         var c = sel.location
         while c < length, isHidden(c) { c += 1 }
@@ -235,11 +422,97 @@ final class EditorTextView: NSTextView {
             replace(NSRange(location: c, length: NSMaxRange(pre) - c), with: "", caret: sel.location)
             return
         }
-        if c != sel.location {
-            replace(ns.rangeOfComposedCharacterSequence(at: c), with: "", caret: sel.location)
+        // Joining with a following rule removes the rule; a fence is left alone.
+        if ns.character(at: c) == 10, let h = hiddenLine(at: c + 1), h.location == c + 1 {
+            if textStorage?.attribute(.jotRule, at: h.location, effectiveRange: nil) != nil {
+                replace(NSRange(location: c, length: NSMaxRange(h) - c), with: "", caret: sel.location)
+            }
+            return
+        }
+        let target = ns.rangeOfComposedCharacterSequence(at: c)
+        if c != sel.location || (isHidden(c - 1) && isHidden(NSMaxRange(target))) {
+            deleteVisible(target, caret: sel.location)
             return
         }
         super.deleteForward(sender)
+    }
+
+    /// Deletes visible text; if that empties a span ("**b**" → "****"), the span's
+    /// markers go too instead of turning into literal asterisks.
+    private func deleteVisible(_ r: NSRange, caret: Int? = nil) {
+        let end = NSMaxRange(r)
+        if isHidden(r.location - 1), isHidden(end) {
+            var a = r.location
+            while a > 0, isHidden(a - 1), prefixRange(at: a - 1) == nil { a -= 1 }
+            var b = end
+            while b < length, isHidden(b) { b += 1 }
+            let left = ns.substring(with: NSRange(location: a, length: r.location - a))
+            let right = ns.substring(with: NSRange(location: end, length: b - end))
+            for m in ["**", "__", "~~", "`", "*", "_"] where left.hasSuffix(m) && right.hasPrefix(m) {
+                let ml = (m as NSString).length
+                replace(NSRange(location: r.location - ml, length: r.length + 2 * ml), with: "", caret: r.location - ml)
+                return
+            }
+            if left.hasSuffix("["), right.hasPrefix("](") {   // a link whose text is gone
+                replace(NSRange(location: r.location - 1, length: b - r.location + 1), with: "", caret: r.location - 1)
+                return
+            }
+        }
+        replace(r, with: "", caret: caret)
+    }
+
+    // ⌥⌫ / ⌘⌫ / ⌥⌦: let AppKit pick the range, then keep it out of prefixes and
+    // never leave half a marker pair behind.
+    override func deleteWordBackward(_ sender: Any?) {
+        deleteSpanBackward({ super.moveWordBackwardAndModifySelection(nil) }, fallback: { super.deleteWordBackward(sender) })
+    }
+    override func deleteToBeginningOfLine(_ sender: Any?) {
+        deleteSpanBackward({ super.moveToBeginningOfLineAndModifySelection(nil) }, fallback: { super.deleteToBeginningOfLine(sender) })
+    }
+    override func deleteToBeginningOfParagraph(_ sender: Any?) {
+        deleteSpanBackward({ super.moveToBeginningOfParagraphAndModifySelection(nil) }, fallback: { super.deleteToBeginningOfParagraph(sender) })
+    }
+    override func deleteWordForward(_ sender: Any?) {
+        let sel = selectedRange()
+        guard sel.length == 0 else { return super.deleteWordForward(sender) }
+        super.moveWordForwardAndModifySelection(nil)
+        let r = selectedRange()
+        guard r.location == sel.location, r.length > 0 else { setSelectedRange(sel); return }
+        var start = r.location
+        while start < NSMaxRange(r), isHidden(start) { start += 1 }   // keep leading markers
+        deleteSpan(NSRange(location: start, length: NSMaxRange(r) - start), caret: sel.location)
+    }
+
+    private func deleteSpanBackward(_ extend: () -> Void, fallback: () -> Void) {
+        let sel = selectedRange()
+        guard sel.length == 0, sel.location > 0 else { return fallback() }
+        let p = sel.location
+        // At the content start of an item / heading: same as Backspace.
+        if p == contentStart(ofLineAt: p), let pre = prefixRange(at: p - 1), NSMaxRange(pre) == p {
+            removePrefix(pre)
+            return
+        }
+        extend()   // selection snapping keeps the start out of this line's prefix
+        let r = selectedRange()
+        guard NSMaxRange(r) == p, r.length > 0 else { setSelectedRange(sel); return }
+        var end = NSMaxRange(r)
+        while end > r.location, isHidden(end - 1) { end -= 1 }   // keep trailing markers
+        deleteSpan(NSRange(location: r.location, length: end - r.location), caret: nil)
+    }
+
+    /// Deletes a word/line range. If it swallowed a closing marker, also take the
+    /// opening run just before it, so "x **bold** |" ⌥⌫ doesn't leave "x **".
+    private func deleteSpan(_ r: NSRange, caret: Int?) {
+        guard r.length > 0 else { setSelectedRange(NSRange(location: caret ?? r.location, length: 0)); return }
+        var r = r
+        var hiddenInside = false
+        for i in r.location..<NSMaxRange(r) where isInlineMarker(i) { hiddenInside = true; break }
+        if hiddenInside {
+            var a = r.location
+            while a > 0, isInlineMarker(a - 1) { a -= 1 }
+            r = NSRange(location: a, length: NSMaxRange(r) - a)
+        }
+        deleteVisible(r, caret: caret.map { min($0, r.location) })
     }
 
     /// Backspace at the start of a prefixed line: outdent if nested, else remove the prefix.
@@ -274,6 +547,12 @@ final class EditorTextView: NSTextView {
             return
         }
 
+        // Return over a selection inside a list item: drop the selection, then continue the list.
+        if sel.length > 0, ListPrefix.parse(lineText) != nil, NSMaxRange(sel) <= NSMaxRange(lineRange) {
+            replace(sel, with: "")
+            return insertNewline(sender)
+        }
+
         if sel.length == 0, let list = ListPrefix.parse(lineText) {
             let contentStart = lineRange.location + list.length
             let content = (lineText as NSString).substring(from: min(list.length, (lineText as NSString).length))
@@ -284,18 +563,60 @@ final class EditorTextView: NSTextView {
                 return
             }
             if sel.location >= contentStart {
-                insertText("\n" + list.continuation(), replacementRange: sel)
+                let insertion = "\n" + list.continuation()
+                if list.isNumbered, let n = Int(list.marker.dropLast()),
+                   let (tail, renumbered) = renumberedItems(after: NSMaxRange(lineRange), level: list.level, startingAt: n + 2) {
+                    // One edit: the new item plus the renumbered items below it.
+                    let rest = ns.substring(with: NSRange(location: sel.location, length: tail.location - sel.location))
+                    replace(NSRange(location: sel.location, length: NSMaxRange(tail) - sel.location),
+                            with: insertion + rest + renumbered, caret: sel.location + (insertion as NSString).length)
+                } else {
+                    insertText(insertion, replacementRange: sel)
+                }
                 return
             }
         }
+
+        // Return at the start of a heading / quote pushes it down instead of
+        // splitting its (invisible) "# " off onto an empty line.
+        if sel.length == 0, let pre = prefixRange(at: lineRange.location), pre.location == lineRange.location,
+           sel.location == NSMaxRange(pre), sel.location < lineRange.location + (lineText as NSString).length {
+            replace(NSRange(location: lineRange.location, length: 0), with: "\n", caret: sel.location + 1)
+            return
+        }
         super.insertNewline(sender)
+    }
+
+    /// Numbered items below `loc` at `level`, renumbered from `first`. Returns the
+    /// range they cover and the new text, or nil if nothing changes.
+    private func renumberedItems(after loc: Int, level: Int, startingAt first: Int) -> (NSRange, String)? {
+        var n = first
+        var next = loc
+        var end = loc
+        var changed = false
+        var out = ""
+        while next < length {
+            let line = ns.lineRange(for: NSRange(location: next, length: 0))
+            let text = ns.substring(with: line)
+            guard let p = ListPrefix.parse(contentOfLine(line)) else { break }
+            if p.level > level { out += text; next = NSMaxRange(line); end = next; continue }   // nested items keep theirs
+            guard p.level == level, p.isNumbered, let delim = p.marker.last else { break }
+            let want = "\(n)\(delim)"
+            if want != p.marker { changed = true }
+            out += p.indent + want + (text as NSString).substring(from: (p.indent as NSString).length + (p.marker as NSString).length)
+            n += 1
+            next = NSMaxRange(line)
+            end = next
+        }
+        guard changed else { return nil }
+        return (NSRange(location: loc, length: end - loc), out)
     }
 
     override func insertTab(_ sender: Any?) {
         let sel = selectedRange()
         let lines = ns.paragraphRange(for: sel)
         let multiLine = ns.substring(with: sel).contains("\n")
-        if multiLine || ListPrefix.parse(contentOfLine(lines)) != nil, !inCodeBlock(sel.location) {
+        if multiLine || (ListPrefix.parse(contentOfLine(lines)) != nil && !inCodeBlock(sel.location)) {
             indentLines(sender)
         } else {
             super.insertTab(sender)
@@ -305,12 +626,20 @@ final class EditorTextView: NSTextView {
     override func insertBacktab(_ sender: Any?) { outdentLines(sender) }
 
     /// "[] " or "[ ] " typed at the start of a line becomes a checklist item.
+    /// ⌃↩ / ⌥↩ insert U+2028; Jot's text is plain lines, so that's just a newline.
+    override func insertLineBreak(_ sender: Any?) { insertNewline(sender) }
+
     override func insertText(_ string: Any, replacementRange: NSRange) {
+        if let str = string as? String, Fences.normalizeNewlines(str) != str {
+            return insertText(Fences.normalizeNewlines(str), replacementRange: replacementRange)
+        }
         if let str = string as? String, str == " ", replacementRange.location == NSNotFound || replacementRange.length == 0 {
             let sel = selectedRange()
             let line = ns.lineRange(for: NSRange(location: sel.location, length: 0))
             let before = ns.substring(with: NSRange(location: line.location, length: sel.location - line.location))
-            let trimmed = before.trimmingCharacters(in: .whitespaces)
+            var trimmed = before.trimmingCharacters(in: .whitespaces)
+            // "- " is invisible, so "[] " typed into an empty bullet counts too.
+            for bullet in ["- ", "* ", "+ "] where trimmed.hasPrefix(bullet) { trimmed = String(trimmed.dropFirst(2)); break }
             if (trimmed == "[]" || trimmed == "[ ]"), !inCodeBlock(sel.location) {
                 let indent = String(before.prefix { $0 == " " || $0 == "\t" })
                 replace(NSRange(location: line.location, length: sel.location - line.location), with: indent + "- [ ] ")
@@ -371,11 +700,29 @@ final class EditorTextView: NSTextView {
     @objc func toggleStrikethrough(_ sender: Any?) { toggleWrap("~~") }
 
     private func toggleWrap(_ m: String) {
-        let sel = selectedRange()
+        var sel = selectedRange()
         let ml = (m as NSString).length
         if sel.length == 0 {
+            // Caret inside an existing span: unwrap it.
+            if let span = enclosingSpan(m, at: sel.location) {
+                let mk = span.marker
+                let inner = NSRange(location: span.range.location + mk, length: span.range.length - 2 * mk)
+                replace(span.range, with: ns.substring(with: inner), caret: sel.location - mk)
+                return
+            }
             insertText(m + m, replacementRange: sel)
             setSelectedRange(NSRange(location: sel.location + ml, length: 0))
+            return
+        }
+        // "**word **" or "**line\n**" don't render: wrap the trimmed text, line by line.
+        let raw = ns.substring(with: sel) as NSString
+        var a = 0, b = raw.length
+        while a < b, CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar(raw.character(at: a)) ?? " ") { a += 1 }
+        while b > a, CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar(raw.character(at: b - 1)) ?? " ") { b -= 1 }
+        guard b > a else { return }
+        sel = NSRange(location: sel.location + a, length: b - a)
+        if ns.substring(with: sel).contains("\n") {
+            wrapLines(in: sel, m)
             return
         }
         let text = ns.substring(with: sel)
@@ -393,6 +740,51 @@ final class EditorTextView: NSTextView {
             replace(sel, with: m + text + m)
             setSelectedRange(NSRange(location: sel.location + ml, length: sel.length))
         }
+    }
+
+    /// The `m` span (bold, italic, code, strike) around `loc` on its line, if any.
+    private func enclosingSpan(_ m: String, at loc: Int) -> (range: NSRange, marker: Int)? {
+        let re: NSRegularExpression
+        switch m {
+        case "**": re = MarkdownPatterns.bold
+        case "`": re = MarkdownPatterns.inlineCode
+        case "~~": re = MarkdownPatterns.strike
+        default: re = MarkdownPatterns.italic
+        }
+        let line = ns.lineRange(for: NSRange(location: loc, length: 0))
+        let text = ns.substring(with: line)
+        for match in re.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length)) {
+            let r = NSRange(location: match.range.location + line.location, length: match.range.length)
+            let mk = m == "`" ? 1 : match.range(at: 1).length
+            if loc >= r.location + mk, loc <= NSMaxRange(r) - mk { return (r, mk) }
+        }
+        return nil
+    }
+
+    /// Wraps (or unwraps, if all already are) each line's content in `m`.
+    private func wrapLines(in sel: NSRange, _ m: String) {
+        let paragraph = ns.paragraphRange(for: sel)
+        var lines = ns.substring(with: paragraph).components(separatedBy: "\n")
+        let trailing = lines.last == ""
+        if trailing { lines.removeLast() }
+        func split(_ line: String) -> (prefix: String, body: String, tail: String) {
+            let pre = ListPrefix.parse(line)?.length
+                ?? MarkdownPatterns.heading.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length))?.range.length
+                ?? MarkdownPatterns.quote.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length))?.range.length ?? 0
+            let rest = (line as NSString).substring(from: pre)
+            let body = rest.trimmingCharacters(in: .whitespaces)
+            let lead = (line as NSString).substring(to: pre) + String(rest.prefix { $0 == " " || $0 == "\t" })
+            return (lead, body, String(rest.reversed().prefix { $0 == " " || $0 == "\t" }.reversed()))
+        }
+        let parts = lines.map(split)
+        let allWrapped = parts.allSatisfy { $0.body.isEmpty || ($0.body.hasPrefix(m) && $0.body.hasSuffix(m) && $0.body.count >= 2 * m.count) }
+        let out = parts.map { p -> String in
+            guard !p.body.isEmpty else { return p.prefix + p.tail }
+            let body = allWrapped ? String(p.body.dropFirst(m.count).dropLast(m.count)) : m + p.body + m
+            return p.prefix + body + p.tail
+        }.joined(separator: "\n") + (trailing ? "\n" : "")
+        replace(paragraph, with: out)
+        setSelectedRange(NSRange(location: paragraph.location, length: (out as NSString).length - (trailing ? 1 : 0)))
     }
 
     /// Applies `f` to every line touched by the selection as one undoable edit.
@@ -487,7 +879,7 @@ final class EditorTextView: NSTextView {
             return true
         default:
             guard let text = pboard.string(forType: .string) else { return false }
-            let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+            let normalized = Fences.normalizeNewlines(text)
             replace(selectedRange(), with: Atoms.decode(normalized, styler: styler))
             return true
         }
@@ -500,7 +892,7 @@ final class EditorTextView: NSTextView {
         let anyImage = markdown.contains { $0.hasPrefix("!") }
         var text = markdown.joined(separator: anyImage ? "\n" : " ")
         if anyImage {
-            if sel.location > line.location { text = "\n" + text }
+            if sel.location > contentStart(ofLineAt: line.location) { text = "\n" + text }
             if NSMaxRange(sel) < length, ns.character(at: NSMaxRange(sel)) != 10 { text += "\n" }
         }
         replace(sel, with: Atoms.decode(text, styler: styler))
@@ -508,8 +900,23 @@ final class EditorTextView: NSTextView {
 
     // MARK: Editing primitives (all undoable)
 
+    /// Replaces only the part that actually changes (so undo restores a small
+    /// range and the caret lands where the change was, not at the line's end).
     private func replace(_ range: NSRange, with str: String, caret: Int? = nil) {
-        replace(range, with: NSAttributedString(string: str, attributes: typingAttributes), caret: caret)
+        let caret = caret ?? range.location + (str as NSString).length
+        let old = Array(ns.substring(with: range)), new = Array(str)
+        var head = 0
+        while head < old.count, head < new.count, old[head] == new[head] { head += 1 }
+        var tail = 0
+        while tail < old.count - head, tail < new.count - head, old[old.count - 1 - tail] == new[new.count - 1 - tail] { tail += 1 }
+        let headLen = String(old[..<head]).utf16.count
+        let oldMid = String(old[head..<(old.count - tail)]), newMid = String(new[head..<(new.count - tail)])
+        let r = NSRange(location: range.location + headLen, length: oldMid.utf16.count)
+        guard r.length > 0 || !newMid.isEmpty else {
+            setSelectedRange(NSRange(location: caret, length: 0))
+            return
+        }
+        replace(r, with: NSAttributedString(string: newMid, attributes: typingAttributes), caret: caret)
     }
 
     private func replace(_ range: NSRange, with str: NSAttributedString, caret: Int? = nil) {
@@ -528,7 +935,11 @@ final class EditorTextView: NSTextView {
 
     private func inCodeBlock(_ loc: Int) -> Bool {
         guard let s = textStorage, s.length > 0 else { return false }
-        let i = min(loc, s.length - 1)
-        return s.attribute(.jotCodeRegion, at: i, effectiveRange: nil) != nil
+        if loc >= s.length {
+            // Empty last line: only inside a block that was never closed.
+            guard ns.character(at: s.length - 1) == 10 else { return s.attribute(.jotCodeRegion, at: s.length - 1, effectiveRange: nil) != nil }
+            return (s.attribute(.jotCodeRegion, at: s.length - 1, effectiveRange: nil) as? CodeRegion)?.closed == false
+        }
+        return s.attribute(.jotCodeRegion, at: loc, effectiveRange: nil) != nil
     }
 }

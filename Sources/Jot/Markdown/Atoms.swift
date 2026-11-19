@@ -16,7 +16,8 @@ enum Atoms {
         let out = NSMutableAttributedString(string: markdown, attributes: styler.typingAttributes)
         let ns = markdown as NSString
         let matches = MarkdownPatterns.atom.matches(in: markdown, range: NSRange(location: 0, length: ns.length))
-        for m in matches.reversed() {
+        let fences = matches.isEmpty || ns.range(of: "`").location == NSNotFound ? [] : Fences.scan(ns)
+        for m in matches.reversed() where !(ns.range(of: "`").location != NSNotFound && isInCode(m.range, ns, fences: fences)) {
             let bang = m.range(at: 1).length == 1
             let name = ns.substring(with: m.range(at: 2))
             let path = ns.substring(with: m.range(at: 3))
@@ -25,6 +26,21 @@ enum Atoms {
             out.replaceCharacters(in: m.range, with: atom)
         }
         return out
+    }
+
+    /// Fenced blocks and `inline code`: Markdown there is shown literally, so an
+    /// image link inside a code sample stays text.
+    private static func isInCode(_ r: NSRange, _ ns: NSString, fences: [NSRange]) -> Bool {
+        var i = 0
+        while i < fences.count {
+            let end = i + 1 < fences.count ? NSMaxRange(fences[i + 1]) : ns.length
+            if r.location >= fences[i].location, r.location < end { return true }
+            i += 2
+        }
+        let line = ns.lineRange(for: NSRange(location: r.location, length: 0))
+        let text = ns.substring(with: line)
+        return MarkdownPatterns.inlineCode.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
+            .contains { NSIntersectionRange(NSRange(location: $0.range.location + line.location, length: $0.range.length), r).length > 0 }
     }
 
     /// Attributed range → Markdown, expanding attachments back to their source.
@@ -92,7 +108,11 @@ final class ImageAttachmentCell: NSTextAttachmentCell {
 
     override func cellFrame(for textContainer: NSTextContainer, proposedLineFragment lineFrag: NSRect,
                             glyphPosition position: NSPoint, characterIndex charIndex: Int) -> NSRect {
-        let size = fittedSize(maxWidth: lineFrag.width - position.x - textContainer.lineFragmentPadding * 2)
+        // Fit the full text width (minus the paragraph's indent), not what's left of
+        // this line: text typed before an image wraps it instead of shrinking it.
+        let style = textContainer.layoutManager?.textStorage.flatMap { charIndex < $0.length ? $0.attribute(.paragraphStyle, at: charIndex, effectiveRange: nil) as? NSParagraphStyle : nil }
+        let indent = style?.headIndent ?? 0
+        let size = fittedSize(maxWidth: lineFrag.width - indent - textContainer.lineFragmentPadding * 2)
         return NSRect(x: 0, y: 0, width: size.width, height: size.height + 6)
     }
 

@@ -98,6 +98,15 @@ final class MarkdownLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         guard let storage = textStorage, glyphRange.length > 0 else { return false }
         let ci = characterIndexForGlyph(at: glyphRange.location)
         guard ci < storage.length, storage.attribute(.jotFence, at: ci, effectiveRange: nil) != nil else { return false }
+        // Only a bare fence collapses; "```swift" keeps a normal line for its tag.
+        let line = storage.mutableString.lineRange(for: NSRange(location: ci, length: 0))
+        var content = line
+        if content.length > 0, storage.mutableString.character(at: NSMaxRange(content) - 1) == 10 { content.length -= 1 }
+        if content.length > 0 {
+            var hidden = NSRange()
+            if storage.attribute(.jotHidden, at: content.location, longestEffectiveRange: &hidden, in: content) == nil
+                || NSMaxRange(hidden) < NSMaxRange(content) { return false }
+        }
         let h = Self.fenceLineHeight
         lineFragmentRect.pointee.size.height = h
         lineFragmentUsedRect.pointee.size.height = h

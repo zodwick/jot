@@ -63,7 +63,7 @@ final class MarkdownEditorStack {
         storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: "")
         storage.endEditing()
         storage.beginEditing()
-        storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: Atoms.decode(markdown, styler: styler))
+        storage.replaceCharacters(in: NSRange(location: 0, length: 0), with: Atoms.decode(Fences.normalizeNewlines(markdown), styler: styler))
         storage.endEditing()   // the styling delegate styles the whole page here
         textView.undoManager?.removeAllActions()
     }

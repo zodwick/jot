@@ -3,6 +3,14 @@ import AppKit
 /// `JOT_SELFTEST=1 Jot` runs scripted editing cases through the real editor
 /// (same command methods a key press triggers) and exits non-zero on failure.
 /// "|" in a case marks the caret (or "[" … "]" style selection via `select`).
+private extension NSAttributedString {
+    func attribute(_ key: Key, in range: NSRange) -> Any? {
+        var found: Any?
+        enumerateAttribute(key, in: range) { v, _, stop in if v != nil { found = v; stop.pointee = true } }
+        return found
+    }
+}
+
 enum SelfTest {
     static func run() -> Never {
         var failures = 0
@@ -57,6 +65,54 @@ enum SelfTest {
         check("bold wraps selection", "a word b", select: NSRange(location: 2, length: 4), expect: "a **word** b") { $0.toggleBold(nil) }
         check("bold unwraps", "a **word** b", select: NSRange(location: 4, length: 4), expect: "a word b") { $0.toggleBold(nil) }
         check("bullet toggle", "one\ntwo", select: NSRange(location: 0, length: 7), expect: "- one\n- two") { $0.toggleBulletList(nil) }
+        // Typing anywhere but a line's end must keep the caret where you type
+        // (restyling the line once moved it to the line's end).
+        func type(_ tv: EditorTextView, _ s: String) {
+            for ch in s { tv.insertText(String(ch), replacementRange: NSRange(location: NSNotFound, length: 0)) }
+        }
+        check("type on empty middle line", "one\n|\nthree", expect: "one\nabc|\nthree") { type($0, "abc") }
+        check("type at start of middle line", "one\n|mid\nthree", expect: "one\nabc|mid\nthree") { type($0, "abc") }
+        check("type inside a line", "one\nm|id\nthree", expect: "one\nmabc|id\nthree") { type($0, "abc") }
+        check("type then delete on empty line", "one\n|\nthree", expect: "one\n|\nthree") { tv in
+            type(tv, "abc"); tv.deleteBackward(nil); tv.deleteBackward(nil); tv.deleteBackward(nil)
+        }
+        check("type inside a list item", "- one|x\n- two", expect: "- oneabc|x\n- two") { type($0, "abc") }
+        check("type inside bold", "a **bo|ld** b", expect: "a **boabc|ld** b") { type($0, "abc") }
+        check("type in code block", "```\nf|oo\n```", expect: "```\nfabc|oo\n```") { type($0, "abc") }
+        // Collapsed "---" / ``` lines.
+        check("backspace un-hides rule", "---|", expect: "--|") { $0.deleteBackward(nil) }
+        check("backspace after rule removes it", "a\n---\n|b", expect: "a\n|b") { $0.deleteBackward(nil) }
+        check("backspace after fence steps over it", "```\ncode\n```\n|b", expect: "```\ncode|\n```\nb") { $0.deleteBackward(nil) }
+        check("right skips closing fence", "```\ncode|\n```\nafter", expect: "```\ncode\n```\n|after") { $0.moveRight(nil) }
+        check("left skips closing fence", "```\ncode\n```\n|after", expect: "```\ncode|\n```\nafter") { $0.moveLeft(nil) }
+        check("caret never inside a fence", "```\ncode\n`|``\nafter", expect: "```\ncode\n```|\nafter") { _ in }
+        // Return.
+        check("return at heading start pushes it down", "# |Title", expect: "\n# |Title") { $0.insertNewline(nil) }
+        check("return renumbers the list below", "1. a|\n2. b\n3. c", expect: "1. a\n2. |\n3. b\n4. c") { $0.insertNewline(nil) }
+        check("return over selection in item", "- abcd", select: NSRange(location: 3, length: 2), expect: "- a\n- |d") { $0.insertNewline(nil) }
+        // Selections and word/line deletes never eat prefixes or leave half a marker pair.
+        check("selection into bullet is snapped", "x\n- item", select: NSRange(location: 2, length: 6), expect: "x\n- |") { $0.deleteBackward(nil) }
+        check("cmd-delete keeps bullet", "- item|", expect: "- |") { $0.deleteToBeginningOfLine(nil) }
+        check("option-delete over bold", "a **bold**|", expect: "a |") { $0.deleteWordBackward(nil) }
+        check("option-delete past bold", "x **bold** |", expect: "x |") { $0.deleteWordBackward(nil) }
+        check("backspace empties a span", "a **b**|", expect: "a |") { $0.deleteBackward(nil) }
+        check("forward delete empties a span", "a |`c`", expect: "a |") { $0.deleteForward(nil) }
+        check("backspace into heading prefix", "x\n# **b**|", expect: "x\n|**b**") { tv in tv.moveLeft(nil); tv.deleteBackward(nil) }
+        check("shift-left selects the visible letter", "x **bold**|", expect: "x **bol|**") { tv in
+            tv.moveLeftAndModifySelection(nil); tv.deleteBackward(nil)
+        }
+        check("deleting a selection keeps markers", "a **bold** b", select: NSRange(location: 4, length: 6), expect: "a | b") { $0.deleteBackward(nil) }
+        // Formatting commands.
+        check("bold toggle unwraps around caret", "a **bo|ld** b", expect: "a bo|ld b") { $0.toggleBold(nil) }
+        check("bold trims trailing space", "a word b", select: NSRange(location: 2, length: 5), expect: "a **word** b") { $0.toggleBold(nil) }
+        check("[] on an empty bullet", "- |", expect: "- [ ] |") { tv in
+            tv.insertText("[", replacementRange: NSRange(location: NSNotFound, length: 0))
+            tv.insertText("]", replacementRange: NSRange(location: NSNotFound, length: 0))
+            tv.insertText(" ", replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        check("tab indents lines in code", "```\na\nb\n```", select: NSRange(location: 4, length: 3), expect: "```\n\ta\n\tb\n```") { $0.insertTab(nil) }
+        check("ctrl-return is a newline", "a|b", expect: "a\n|b") { $0.insertLineBreak(nil) }
+
         check("checkbox toggle via text", "- [ ] a|", expect: "- [ ] a\n- [ ] b|") { tv in
             tv.insertNewline(nil); tv.insertText("b", replacementRange: NSRange(location: NSNotFound, length: 0))
         }
@@ -106,6 +162,51 @@ enum SelfTest {
             if md2.contains("\n![](attachments/image-"), md2.hasSuffix(".png)") { passed += 1 }
             else { failures += 1; print("FAIL paste image: \(md2.debugDescription)") }
             pb.releaseGlobally()
+        }
+
+        // Emoji typed into styled text keep their fallback font (no tofu boxes).
+        do {
+            let stack = MarkdownEditorStack()
+            stack.load(markdown: "**hi **")
+            stack.textView.setSelectedRange(NSRange(location: 5, length: 0))
+            stack.textView.insertText("😀", replacementRange: NSRange(location: NSNotFound, length: 0))
+            let font = stack.storage.attribute(.font, at: 5, effectiveRange: nil) as? NSFont
+            if font?.fontName.contains("Emoji") == true { passed += 1 }
+            else { failures += 1; print("FAIL emoji font: \(String(describing: font?.fontName))") }
+        }
+
+        // Styling: what the user sees after edits matches a fresh load of the same text.
+        do {
+            func styled(_ md: String, at: Int, _ action: (EditorTextView) -> Void, _ test: (MarkdownEditorStack) -> Bool, _ name: String) {
+                let stack = MarkdownEditorStack()
+                stack.load(markdown: md)
+                stack.textView.setSelectedRange(NSRange(location: at, length: 0))
+                action(stack.textView)
+                if test(stack) { passed += 1 } else { failures += 1; print("FAIL \(name): \(stack.markdown().debugDescription)") }
+            }
+            func font(_ st: MarkdownEditorStack, _ i: Int) -> CGFloat { (st.storage.attribute(.font, at: i, effectiveRange: nil) as? NSFont)?.pointSize ?? 0 }
+            func hidden(_ st: MarkdownEditorStack, _ i: Int) -> Bool { st.storage.attribute(.jotHidden, at: i, effectiveRange: nil) != nil }
+            styled("# Hello world", at: 8, { $0.insertNewline(nil) }, { font($0, 9) == 15 }, "return mid-heading restyles the new line")
+            styled("> quoted text", at: 8, { $0.insertNewline(nil) }, { $0.storage.attribute(.jotQuote, at: 10, effectiveRange: nil) == nil }, "return mid-quote restyles the new line")
+            styled("see ```js\nx", at: 4, { $0.insertNewline(nil) }, { $0.storage.attribute(.jotCodeRegion, at: 11, effectiveRange: nil) != nil }, "return before ``` opens a block")
+            styled("```swift\ncode\n```", at: 0, { _ in }, { !hidden($0, 3) && hidden($0, 2) }, "fence language tag visible")
+            styled("```x``` is inline\nafter", at: 0, { _ in }, { $0.storage.attribute(.jotCodeRegion, at: 20, effectiveRange: nil) == nil }, "inline triple backticks are prose")
+            styled("**[a](https://x.com)**", at: 0, { _ in }, { hidden($0, 0) && hidden($0, 21) }, "bold around a link")
+            styled("https://x.org/a#o.__dict__ ok", at: 0, { _ in }, { !hidden($0, 17) }, "no emphasis inside URLs")
+            styled("foo__bar__baz", at: 0, { _ in }, { !hidden($0, 3) }, "intraword __ is literal")
+            styled("[C](https://en.wikipedia.org/wiki/C_(lang)) x", at: 0, { _ in }, {
+                ($0.storage.attribute(.link, at: 1, effectiveRange: nil) as? URL)?.absoluteString.hasSuffix("(lang)") == true
+            }, "link URL with parentheses")
+            styled("*\u{FE0F}\u{20E3} *hi*", at: 0, { _ in }, { !hidden($0, 0) }, "keycap emoji isn't an italic marker")
+            styled("a\u{2028}```\nb\n``", at: 0, { tv in
+                tv.setSelectedRange(NSRange(location: tv.textStorage!.length, length: 0))
+                tv.insertText("`", replacementRange: NSRange(location: NSNotFound, length: 0))
+            }, { !$0.storage.string.contains("\u{2028}") }, "line separators are normalised (no crash)")
+            styled("# Title\n", at: 8, { _ in }, { ($0.textView.typingAttributes[.font] as? NSFont)?.pointSize == 15 }, "empty line after heading types body text")
+            styled("`![](attachments/a.png)` and\n```\n![](attachments/b.png)\n```", at: 0, { _ in }, {
+                $0.storage.attribute(.attachment, in: NSRange(location: 0, length: $0.storage.length)) == nil
+            }, "image syntax in code stays text")
+            styled("![](attachments/a(1).png)", at: 0, { _ in }, { $0.storage.length == 1 }, "attachment path with parentheses")
         }
 
         // Floating makes the glass clearer: fixed points, bounds, and no jumps.
