@@ -20,7 +20,10 @@ final class TuckAway: NSObject {
         if item == nil {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
             if let button = item.button {
-                let image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "Show Jot")
+                // A line glyph like the system's own menu extras (Wi‑Fi, Control
+                // Centre), sized to match; template so it follows light/dark menu bars.
+                let image = NSImage(systemSymbolName: "pencil.and.scribble", accessibilityDescription: "Show Jot")?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium))
                 image?.isTemplate = true
                 button.image = image
                 button.toolTip = "Show Jot"
