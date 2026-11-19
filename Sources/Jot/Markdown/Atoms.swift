@@ -27,22 +27,6 @@ enum Atoms {
         return out
     }
 
-    /// Puts every inline image on its own line (older pages may have text beside one).
-    static func isolateImages(_ s: NSMutableAttributedString, styler: MarkdownStyler) {
-        var images: [Int] = []
-        s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length)) { value, r, _ in
-            if (value as? NSTextAttachment)?.attachmentCell is ImageAttachmentCell {
-                for i in r.location..<NSMaxRange(r) { images.append(i) }
-            }
-        }
-        let newline = NSAttributedString(string: "\n", attributes: styler.typingAttributes)
-        for i in images.reversed() {
-            let chars = s.string as NSString
-            if i + 1 >= chars.length || chars.character(at: i + 1) != 10 { s.insert(newline, at: i + 1) }
-            if i > 0, chars.character(at: i - 1) != 10 { s.insert(newline, at: i) }
-        }
-    }
-
     /// Attributed range → Markdown, expanding attachments back to their source.
     static func encode(_ s: NSAttributedString, range: NSRange) -> String {
         var result = ""

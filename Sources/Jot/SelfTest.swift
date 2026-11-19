@@ -64,7 +64,7 @@ enum SelfTest {
         // Atoms round-trip through load → save and copy.
         do {
             let stack = MarkdownEditorStack()
-            let md = "before\n![](attachments/a.png)\nmid [r.pdf](attachments/r.pdf) after\n"
+            let md = "before ![](attachments/a.png) mid [r.pdf](attachments/r.pdf) after\n"
             stack.load(markdown: md)
             let len = stack.storage.length
             if stack.markdown() == md, len < (md as NSString).length { passed += 1 }
@@ -103,35 +103,9 @@ enum SelfTest {
             stack.textView.setSelectedRange(NSRange(location: stack.storage.length, length: 0))
             _ = stack.textView.readSelection(from: pb, type: .tiff)
             let md2 = stack.markdown()
-            if md2.contains("\n![](attachments/image-"), md2.hasSuffix(".png)\n") { passed += 1 }
+            if md2.contains("\n![](attachments/image-"), md2.hasSuffix(".png)") { passed += 1 }
             else { failures += 1; print("FAIL paste image: \(md2.debugDescription)") }
             pb.releaseGlobally()
-        }
-
-        // Images are blocks: own line on load, caret never rests beside one,
-        // Backspace below selects it first, then deletes it.
-        do {
-            let stack = MarkdownEditorStack()
-            stack.load(markdown: "a\n![](attachments/x.png)b")
-            let tv = stack.textView
-            var ok = stack.markdown() == "a\n![](attachments/x.png)\nb"   // split onto its own line
-            // storage: "a"0 "\n"1 IMG2 "\n"3 "b"4
-            tv.setSelectedRange(NSRange(location: 1, length: 0))
-            tv.moveRight(nil)
-            ok = ok && tv.selectedRange().location == 4                    // skips the image line
-            tv.moveLeft(nil)
-            ok = ok && tv.selectedRange().location == 1                    // and back over it
-            tv.setSelectedRange(NSRange(location: 4, length: 0))
-            tv.deleteBackward(nil)
-            ok = ok && tv.selectedRange() == NSRange(location: 2, length: 1) // first: selects the image
-            tv.deleteBackward(nil)
-            ok = ok && stack.markdown() == "a\n\nb"                         // second: deletes it
-            if ok { passed += 1 } else { failures += 1; print("FAIL image block: \(stack.markdown().debugDescription) sel=\(tv.selectedRange())") }
-
-            let end = MarkdownEditorStack()
-            end.load(markdown: "x![](attachments/x.png)")
-            if end.markdown() == "x\n![](attachments/x.png)\n" { passed += 1 }
-            else { failures += 1; print("FAIL image at end: \(end.markdown().debugDescription)") }
         }
 
         // Floating makes the glass clearer: fixed points, bounds, and no jumps.
@@ -154,6 +128,34 @@ enum SelfTest {
         // The global shortcut is opt-in.
         if UserDefaults.standard.object(forKey: "globalHotKey") != nil || !Preferences.globalHotKey { passed += 1 }
         else { failures += 1; print("FAIL hotkey should default to off") }
+
+        // Cursor beside a tall inline image is text height, on the text's baseline.
+        do {
+            let img = NSImage(size: NSSize(width: 400, height: 300))
+            img.lockFocus(); NSColor.blue.setFill(); NSRect(x: 0, y: 0, width: 400, height: 300).fill(); img.unlockFocus()
+            let png = NSBitmapImageRep(data: img.tiffRepresentation!)!.representation(using: .png, properties: [:])!
+            let rel = Store.shared.importData(png, ext: "png", base: "tall")!
+            let stack = MarkdownEditorStack()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
+                                  styleMask: [.titled], backing: .buffered, defer: true)
+            let scroll = NSScrollView(frame: window.contentView!.bounds)
+            scroll.documentView = stack.textView
+            stack.textView.frame = NSRect(x: 0, y: 0, width: 560, height: 680)
+            window.contentView = scroll
+            stack.load(markdown: "a\n![](\(rel))bc")
+            stack.layoutManager.ensureLayout(for: stack.container)
+            let end = stack.storage.length
+            let caret = stack.textView.caretRect(at: end)
+            let lineHeight = stack.layoutManager.lineFragmentRect(forGlyphAt: end - 1, effectiveRange: nil).height
+            let plain = stack.textView.caretRect(at: 1)
+            if let caret, let plain, lineHeight > 200, caret.height < 30, abs(caret.height - plain.height) < 1,
+               caret.maxY > lineHeight - 10 {   // sits at the bottom of the tall line, by the text
+                passed += 1
+            } else {
+                failures += 1
+                print("FAIL caret height: caret=\(String(describing: caret)) plain=\(String(describing: plain)) line=\(lineHeight)")
+            }
+        }
 
         // Big page: styling + incremental edit should stay fast.
         do {

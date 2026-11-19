@@ -33,66 +33,139 @@ final class EditorTextView: NSTextView {
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         var ranges = ranges
         if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
-            var s = snapped(r.location)
-            s = offImageLine(s, movingBack: s < selectedRange().location)
+            let s = snapped(r.location)
             if s != r.location { ranges = [NSValue(range: NSRange(location: s, length: 0))] }
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        setNeedsCaretUpdate()
     }
 
-    // MARK: Images are blocks
+    // MARK: Text-height cursor
+    //
+    // NSTextView sizes its cursor to the whole line, so next to an inline image
+    // it grows to the image's height. Since macOS 14 it no longer calls
+    // drawInsertionPoint(in:color:turnedOn:), so that can't be overridden
+    // (STTextView: FB9713415). Like STTextView, we hide the built-in cursor and
+    // place the system's own NSTextInsertionIndicator ourselves, sized to the
+    // font and sitting on the text baseline. Same look, blink and accent colour.
 
-    /// The line holding an inline image, if `loc` is on one. Images always sit
-    /// on their own line, and the caret never rests there: a caret beside an
-    /// image would be as tall as the image (macOS sizes it to the line).
-    private func imageLine(at loc: Int) -> NSRange? {
-        guard let s = textStorage, s.length > 0 else { return nil }
-        let line = ns.lineRange(for: NSRange(location: min(loc, s.length), length: 0))
-        guard line.length > 0 else { return nil }
-        var found = false
-        s.enumerateAttribute(.attachment, in: line) { value, _, stop in
-            if (value as? NSTextAttachment)?.attachmentCell is ImageAttachmentCell { found = true; stop.pointee = true }
+    private lazy var caret: NSTextInsertionIndicator = {
+        let indicator = NSTextInsertionIndicator(frame: .zero)
+        indicator.displayMode = .hidden
+        addSubview(indicator)
+        return indicator
+    }()
+    private var caretUpdatePending = false
+
+    override var shouldDrawInsertionPoint: Bool { false }
+
+    func setNeedsCaretUpdate() {
+        guard !caretUpdatePending else { return }
+        caretUpdatePending = true
+        DispatchQueue.main.async { [weak self] in
+            self?.caretUpdatePending = false
+            self?.updateCaret()
         }
-        return found ? line : nil
     }
 
-    /// Moves a caret that landed on an image line to the nearest text line in
-    /// the direction it was travelling (walking past stacked images), falling
-    /// back to the other direction at the start/end of the page.
-    private func offImageLine(_ loc: Int, movingBack: Bool) -> Int {
-        var back = movingBack
-        var pos = loc
-        for _ in 0..<64 {
-            guard let line = imageLine(at: pos) else { return pos }
-            let endsWithNewline = ns.character(at: NSMaxRange(line) - 1) == 10
-            if back, line.location > 0 {
-                pos = line.location - 1            // end of the line above
-            } else if endsWithNewline {
-                pos = NSMaxRange(line)             // start of the line below
-                back = false
-            } else if line.location > 0 {
-                pos = line.location - 1
-                back = true
-            } else {
-                return loc                         // the page is just an image
-            }
+    private func updateCaret() {
+        let sel = selectedRange()
+        let active = window?.isKeyWindow == true && window?.firstResponder === self && sel.length == 0
+        guard active, let rect = caretRect(at: sel.location) else {
+            caret.displayMode = .hidden
+            return
         }
-        return loc
+        caret.frame = rect
+        caret.displayMode = .automatic
     }
 
-    /// The image attachment character on the line ending just before `loc`.
-    private func imageEnding(before loc: Int) -> NSRange? {
-        guard loc > 0, ns.character(at: loc - 1) == 10, let line = imageLine(at: loc - 1) else { return nil }
-        return imageCharacter(in: line)
-    }
+    /// Insertion rect for `loc` in view coordinates: the x NSTextView would use,
+    /// but only as tall as the text's font, on the line's baseline.
+    func caretRect(at loc: Int) -> NSRect? {
+        guard let lm = layoutManager, let tc = textContainer, let s = textStorage else { return nil }
+        let font = caretFont(at: loc)
+        var x: CGFloat
+        var baseline: CGFloat
+        var lineTop: CGFloat
+        var lineBottom: CGFloat
 
-    private func imageCharacter(in line: NSRange) -> NSRange? {
-        var hit: NSRange?
-        textStorage?.enumerateAttribute(.attachment, in: line) { value, r, stop in
-            if (value as? NSTextAttachment)?.attachmentCell is ImageAttachmentCell { hit = NSRange(location: r.location, length: 1); stop.pointee = true }
+        let afterLastNewline = s.length == 0 || (loc == s.length && ns.character(at: loc - 1) == 10)
+        if afterLastNewline {
+            // Empty page or empty last line: the "extra" line fragment.
+            let extra = lm.extraLineFragmentRect
+            let indent = (typingAttributes[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 0
+            x = extra.minX + tc.lineFragmentPadding + indent
+            lineTop = extra.minY
+            lineBottom = extra.maxY
+            baseline = extra.minY + ceil(font.ascender)
+        } else {
+            var count = 0
+            let zero = NSRange(location: loc, length: 0)
+            guard let rects = lm.rectArray(forCharacterRange: zero, withinSelectedCharacterRange: zero, in: tc, rectCount: &count),
+                  count > 0 else { return nil }
+            let r = rects[0]
+            x = r.minX
+            var lineGlyphs = NSRange()
+            let g = lm.glyphIndex(for: NSPoint(x: r.minX, y: r.midY), in: tc)
+            let line = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: &lineGlyphs)
+            lineTop = line.minY
+            lineBottom = line.maxY
+            baseline = line.minY + lm.location(forGlyphAt: lineGlyphs.location).y
         }
-        return hit
+
+        let height = ceil(font.ascender - font.descender)
+        let top = max(lineTop, baseline - ceil(font.ascender))
+        let h = max(2, min(height, lineBottom - top))
+        let origin = textContainerOrigin
+        return NSRect(x: (x + origin.x - 1).rounded(), y: (top + origin.y).rounded(), width: 2, height: h.rounded())
     }
+
+    /// The font the cursor should match: the character before it on the same
+    /// line, else the one after it, else what you'd type next.
+    private func caretFont(at loc: Int) -> NSFont {
+        let fallback = (typingAttributes[.font] as? NSFont) ?? .systemFont(ofSize: 15)
+        guard let s = textStorage, s.length > 0 else { return fallback }
+        func textFont(_ i: Int) -> NSFont? {
+            guard i >= 0, i < s.length else { return nil }
+            let c = ns.character(at: i)
+            if c == 10 || c == 13 || s.attribute(.attachment, at: i, effectiveRange: nil) != nil { return nil }
+            return s.attribute(.font, at: i, effectiveRange: nil) as? NSFont
+        }
+        return textFont(loc - 1) ?? textFont(loc) ?? fallback
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        setNeedsCaretUpdate()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        setNeedsCaretUpdate()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        defer { setNeedsCaretUpdate() }
+        return super.becomeFirstResponder()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        defer { setNeedsCaretUpdate() }
+        return super.resignFirstResponder()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        guard let window else { return }
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(windowKeyChanged), name: name, object: window)
+        }
+        setNeedsCaretUpdate()
+    }
+
+    @objc private func windowKeyChanged() { setNeedsCaretUpdate() }
 
     // MARK: Arrow keys skip invisible characters
 
@@ -133,12 +206,6 @@ final class EditorTextView: NSTextView {
         guard sel.length == 0, sel.location > 0 else { return super.deleteBackward(sender) }
         let p = sel.location
 
-        // Right below an image: select it first; a second Backspace deletes it.
-        if let image = imageEnding(before: p) {
-            setSelectedRange(image)
-            return
-        }
-
         // At the start of a list item / heading / quote: drop (or outdent) the prefix.
         if let pre = prefixRange(at: p - 1), NSMaxRange(pre) == p {
             removePrefix(pre)
@@ -160,12 +227,6 @@ final class EditorTextView: NSTextView {
     override func deleteForward(_ sender: Any?) {
         let sel = selectedRange()
         guard sel.length == 0, sel.location < length else { return super.deleteForward(sender) }
-        // Right above an image: select it first; a second Delete removes it.
-        if ns.character(at: sel.location) == 10, let line = imageLine(at: sel.location + 1),
-           line.location == sel.location + 1, let image = imageCharacter(in: line) {
-            setSelectedRange(image)
-            return
-        }
         var c = sel.location
         while c < length, isHidden(c) { c += 1 }
         guard c < length else { return }
@@ -440,7 +501,7 @@ final class EditorTextView: NSTextView {
         var text = markdown.joined(separator: anyImage ? "\n" : " ")
         if anyImage {
             if sel.location > line.location { text = "\n" + text }
-            if NSMaxRange(sel) == length || ns.character(at: NSMaxRange(sel)) != 10 { text += "\n" }
+            if NSMaxRange(sel) < length, ns.character(at: NSMaxRange(sel)) != 10 { text += "\n" }
         }
         replace(sel, with: Atoms.decode(text, styler: styler))
     }

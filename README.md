@@ -35,7 +35,7 @@ Type Markdown and the markers disappear as you go:
 
 On a list item, Return continues the list. Return on an empty item ends it, and Backspace at the start of an item removes its bullet.
 
-Paste or drop a file to add it. Images sit on their own line: the cursor skips past them, and Backspace just below an image selects it first, then deletes it. Other files show as a chip that you double-click to open.
+Paste or drop a file to add it. Images appear inline. Other files show as a chip that you double-click to open.
 
 ## Where things live
 
@@ -48,6 +48,7 @@ Paste or drop a file to add it. Images sit on their own line: the cursor skips p
 ## Design notes
 
 - **Liquid Glass.** Apple's guidelines reserve glass for floating layers, not content backgrounds. Jot's whole window is a small panel floating over other apps, so it uses the adaptive `.regular` glass with a tinted layer under the text; the density slider controls that layer. It switches to `.clear` only at the very bottom of the slider. When Reduce Transparency is on, the window is fully opaque. While floating on top, the layer is set as if the slider were 0.12 closer to Clear, but never less than half its normal strength (0 stays 0, 0.35 → 0.23, 1 → 0.88), and the change fades unless Reduce Motion is on.
+- **Text-height cursor.** `NSTextView` sizes its cursor to the whole line, so beside an inline image it grows to the image's height, and since macOS 14 its old drawing hook is never called. Like STTextView, Jot hides the built-in cursor and places the system's own `NSTextInsertionIndicator` itself, sized to the font on the text baseline.
 - **One copy at a time.** Jot locks its data folder at launch, so a second copy brings the first one forward and quits instead of writing the same `page.md`.
 - **TextKit 1, on purpose.** It is the only text stack with a per-glyph hook for hiding Markdown markers, and its scroll heights are exact.
   - Hidden markers are zero-width control glyphs, never `.null`; null glyphs at the start of a line break indentation.

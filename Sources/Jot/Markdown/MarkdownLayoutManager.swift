@@ -82,6 +82,11 @@ final class MarkdownLayoutManager: NSLayoutManager, NSLayoutManagerDelegate {
         return (topRect.minY, max(bottomRect.maxY, topRect.maxY))
     }
 
+    /// Relayout (resize, font size, images loading) can move the cursor.
+    func layoutManager(_ layoutManager: NSLayoutManager, didCompleteLayoutFor textContainer: NSTextContainer?, atEnd layoutFinishedFlag: Bool) {
+        (textContainer?.textView as? EditorTextView)?.setNeedsCaretUpdate()
+    }
+
     // MARK: Fence lines
 
     func layoutManager(_ layoutManager: NSLayoutManager,
