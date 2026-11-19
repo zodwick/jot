@@ -54,3 +54,7 @@ Paste or drop a file to add it. Images appear inline. Other files show as a chip
   - Bullets are the real `-` character with a `•` drawn over it, which keeps cursor positions simple.
   - Images and files are single attachment characters that are turned back into Markdown on save and copy.
 - **Self-test.** `JOT_SELFTEST=1 .build/release/Jot` runs the editing cases and a 20k-line performance check. Set `JOT_DATA_DIR=/some/dir` to point the app at a scratch data folder.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
